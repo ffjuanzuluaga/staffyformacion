@@ -58,16 +58,25 @@ st.set_page_config(
 )
 
 # Línea de negocio → nombre del equipo de venta (crm.team) en Odoo. Un solo
-# lugar para corregir si el nombre real del equipo no coincide.
+# lugar para corregir si el nombre real del equipo cambia.
 LINEA_TEAM = {
-    "Staff": "Staff",
-    "Formación": "Formación",
-    "Fábrica de Software": "Fábrica de Software",
+    "Staff": "Staffing IT",
+    "Formación": "FORMACION",
+    "Fábrica de Software": "FABRICA SOFTWARE",
 }
 
 # Línea de negocio → nombre de la cuenta analítica (account.analytic.account)
-# que agrupa sus costos/horas. Mismo supuesto que ya usa gdp-dashboard-1.
-LINEA_ANALYTIC = dict(LINEA_TEAM)
+# que agrupa sus costos/horas. OJO: el nombre de la cuenta analítica NO es
+# igual al del equipo de venta (confirmado con Juan Camilo).
+LINEA_ANALYTIC = {
+    "Staff": "Staffing IT",
+    "Formación": "Formación TI",
+    "Fábrica de Software": "Fábrica Software",
+}
+# Inversa (nombre de cuenta analítica en Odoo → línea interna), para volver a
+# la clave interna después de leer account.analytic.line — que trae el
+# nombre de la cuenta, no la línea.
+ANALYTIC_TO_LINEA = {v: k for k, v in LINEA_ANALYTIC.items()}
 
 
 def fmt_money(v: float) -> str:
@@ -289,7 +298,7 @@ def load_analytic_costs(date_from: str, date_to: str):
         return df, None
     df["date"] = pd.to_datetime(df["date"])
     df["mes"] = df["date"].dt.to_period("M").astype(str)
-    df["linea"] = m2o_name(df["account_id"])
+    df["linea"] = m2o_name(df["account_id"]).map(ANALYTIC_TO_LINEA).fillna("Sin línea")
     df["costo"] = -df["amount"]
     return df, None
 
@@ -312,7 +321,7 @@ def load_analytic_hours(date_from: str, date_to: str):
         return df, None
     df["date"] = pd.to_datetime(df["date"])
     df["mes"] = df["date"].dt.to_period("M").astype(str)
-    df["linea"] = m2o_name(df["account_id"])
+    df["linea"] = m2o_name(df["account_id"]).map(ANALYTIC_TO_LINEA).fillna("Sin línea")
     df["persona"] = m2o_name(df["employee_id"])
     return df, None
 
