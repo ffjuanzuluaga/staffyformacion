@@ -1,11 +1,13 @@
 [project]
-name = "blank-app-template"
+name = "staffyformacion"
 version = "0.1.0"
-description = "A simple Streamlit app template."
+description = "Dashboard de las líneas Staff, Formación y Fábrica de Software (Odoo 19) para Firefly."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "streamlit>=1.61.1",
+    "pandas>=2.2",
+    "plotly>=5.24",
 ]
 
 [tool.uv]
