@@ -253,17 +253,20 @@ if not invoices_all.empty and "equipo" in invoices_all.columns:
         else:
             st.dataframe(fact_por_equipo, use_container_width=True, hide_index=True)
             st.caption(
-                "KPI Facturado = `base_cop` (`amount_untaxed_signed`, COP compañía). "
-                "`base_doc_odoo` = columna Base imponible del listado Odoo "
-                "(moneda del documento; si hay USD no es comparable 1:1)."
+                "KPI Facturado = **base_cop** = campo guardado `amount_untaxed_signed` "
+                "(COP compañía a la TRM de la factura). "
+                "**base_doc_odoo** = columna «Base imponible» del listado "
+                "(`amount_untaxed_in_currency_signed`, moneda del documento). "
+                "El tooltip €/USD del listado Odoo **no** es un campo guardado: "
+                "convierte para mostrar con la TRM del día."
             )
             if "moneda" in invoices_all.columns:
                 monedas = sorted(invoices_all["moneda"].dropna().astype(str).unique())
                 if len(monedas) > 1:
                     st.info(
                         "Facturas en " + ", ".join(monedas)
-                        + ". El tablero usa COP compañía; el total de Odoo en "
-                        "Base imponible mezcla monedas del documento."
+                        + ". Para cuadrar con contabilidad usa **base_cop**, no la "
+                        "Base imponible del listado ni el tooltip multi-moneda."
                     )
 
 costos_analytic, err_costo = load_analytic_costs(d1, d2)
@@ -558,9 +561,10 @@ with tab_resumen:
         f"Montos **antes de impuestos**. Para cuadrar en Odoo · "
         f"**Vendido:** Ventas → Pedidos · Fecha del pedido = {anio} · Confirmado · "
         f"Importe sin impuestos. "
-        f"**Facturado:** Facturas de cliente · Fecha de factura = {anio} · Publicadas · "
-        f"**Equipo de ventas** de la factura · base imponible en **COP** "
-        f"(`amount_untaxed_signed`). "
+        f"**Facturado:** Facturas publicadas · equipo de la factura · "
+        f"**`amount_untaxed_signed`** (base s/imp. en COP compañía, TRM de la factura). "
+        f"No uses la «Base imponible» del listado si hay USD (mezcla monedas) ni el "
+        f"tooltip €/USD (TRM del día). "
         f"TRANSFORMACION DIGITAL no entra en este tablero."
     )
 
