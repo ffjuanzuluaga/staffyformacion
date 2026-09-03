@@ -49,8 +49,8 @@ Cuentas analíticas: `Staffing IT`, `Formación TI`, `Fábrica Software`.
 | Plazas activas y proyección | `firefly.staffing.request` (`date_start`/`date_end`, estado confirmado). Fallback: `sale.order` con `is_subscription` |
 | Renovaciones del mes | `firefly.staffing.history` (`event_type=renewal`). Fallback: `sale.order.log` transferencias |
 | Rentabilidad Staff (recurso) | Valor mensual a cobrar − valor a pagar al proveedor − fijo de Diego |
-| Vendido en pesos | `sale.order` confirmadas (`amount_total`) |
-| Facturación | `account.move` posted + facturas ligadas a esas OV |
+| Vendido en pesos | `sale.order` confirmadas por **`date_order`**, **antes de impuestos** (`amount_untaxed`). No usa `create_date` ni cotizaciones en borrador |
+| Facturación | `account.move` posted por **`invoice_date`**, **antes de impuestos** (`amount_untaxed_signed`; NC restan). Cuadra con Base imponible / Importe sin impuestos |
 | Leads / origen | `crm.lead` + `source_id`, filtrado por equipo |
 | Cierre vs. meta | OV confirmadas vs. `meta_anual / 12` |
 | Cursos/proyectos vendidos | Oportunidades `won_status=won` |

@@ -54,6 +54,13 @@ st.set_page_config(
 )
 
 
+# Todos los pesos del tablero son ANTES DE IMPUESTOS (base imponible).
+# Vendido = sale.order.amount_untaxed · Facturado = account.move.amount_untaxed_signed
+# (las notas crédito restan). No se usa amount_total / Total con IVA.
+SALES_COL = "amount_untaxed"
+FACT_COL = "amount_untaxed_signed"
+
+
 def fmt_money(v: float) -> str:
     return f"${v:,.0f}"
 
@@ -149,7 +156,8 @@ projects, err_proj = load_projects(d1, d2)
 
 st.title("📋 Dashboard Staff, Formación y Fábrica de Software")
 st.caption(
-    f"Año {anio} · línea = equipo CRM ({', '.join(LINEA_TEAM.values())}) "
+    f"Año {anio} · montos **antes de impuestos** · "
+    f"línea = equipo CRM ({', '.join(LINEA_TEAM.values())}) "
     f"o `service_line` / solicitud Staff · "
     f"cuentas analíticas: {', '.join(LINEA_ANALYTIC.values())}"
 )
@@ -163,8 +171,8 @@ def kpis_linea(linea: str) -> dict:
     invoices = filtro_linea(invoices_all, linea)
     leads = filtro_linea(leads_all, linea)
     meta = meta_anual_de(metas_lineas, linea)
-    vendido = float(sales["amount_total"].sum()) if not sales.empty else 0.0
-    facturado = float(invoices["amount_total_signed"].sum()) if not invoices.empty else 0.0
+    vendido = float(sales[SALES_COL].sum()) if not sales.empty and SALES_COL in sales else 0.0
+    facturado = float(invoices[FACT_COL].sum()) if not invoices.empty and FACT_COL in invoices else 0.0
     leads_mes = int(leads.loc[leads["mes"] == mes_actual_key].shape[0]) if not leads.empty else 0
     return {
         "meta_anual": meta,
@@ -182,9 +190,9 @@ def kpis_linea(linea: str) -> dict:
 def rentabilidad_contable(linea: str) -> pd.DataFrame:
     invoices = filtro_linea(invoices_all, linea)
     fact_mensual = (
-        invoices.groupby("mes", as_index=False)["amount_total_signed"].sum()
-        .rename(columns={"amount_total_signed": "facturado"})
-        if not invoices.empty else pd.DataFrame(columns=["mes", "facturado"])
+        invoices.groupby("mes", as_index=False)[FACT_COL].sum()
+        .rename(columns={FACT_COL: "facturado"})
+        if not invoices.empty and FACT_COL in invoices else pd.DataFrame(columns=["mes", "facturado"])
     )
     costo_m = (
         costos_analytic[costos_analytic["linea"] == linea].groupby("mes", as_index=False)["costo"].sum()
@@ -200,23 +208,23 @@ def rentabilidad_contable(linea: str) -> pd.DataFrame:
 
 
 def chart_venta_vs_meta(linea: str, sales: pd.DataFrame):
-    st.markdown("#### 💰 Cierre de venta mes a mes vs. meta")
+    st.markdown("#### 💰 Cierre de venta mes a mes vs. meta (antes de impuestos)")
     meta_m = meta_anual_de(metas_lineas, linea) / 12
     ventas_mes = (
-        sales.groupby("mes", as_index=False)["amount_total"].sum()
-        if not sales.empty else pd.DataFrame(columns=["mes", "amount_total"])
+        sales.groupby("mes", as_index=False)[SALES_COL].sum()
+        if not sales.empty and SALES_COL in sales else pd.DataFrame(columns=["mes", SALES_COL])
     )
     base = pd.DataFrame({"mes": months_year}).merge(ventas_mes, on="mes", how="left")
-    base["amount_total"] = base["amount_total"].fillna(0)
+    base[SALES_COL] = base[SALES_COL].fillna(0)
     base["meta_mensual"] = meta_m
-    largo = base.melt(id_vars="mes", value_vars=["meta_mensual", "amount_total"],
+    largo = base.melt(id_vars="mes", value_vars=["meta_mensual", SALES_COL],
                       var_name="concepto", value_name="valor")
-    largo["concepto"] = largo["concepto"].map({"meta_mensual": "Meta mensual", "amount_total": "Vendido"})
+    largo["concepto"] = largo["concepto"].map({"meta_mensual": "Meta mensual", SALES_COL: "Vendido"})
     fig = px.bar(
         largo, x="mes", y="valor", color="concepto", barmode="group",
-        title=f"{linea} — vendido (OV) vs. meta mensual ({anio})",
+        title=f"{linea} — vendido s/imp. (OV) vs. meta mensual ({anio})",
         color_discrete_map={"Meta mensual": "#9ca3af", "Vendido": "#1f77b4"},
-        labels={"valor": "COP", "mes": "Mes"},
+        labels={"valor": "COP s/imp.", "mes": "Mes"},
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -224,14 +232,14 @@ def chart_venta_vs_meta(linea: str, sales: pd.DataFrame):
 def chart_fact_y_leads(linea: str, invoices: pd.DataFrame, leads: pd.DataFrame):
     col_a, col_b = st.columns(2)
     with col_a:
-        st.markdown("#### 🧾 Facturación mes a mes")
+        st.markdown("#### 🧾 Facturación mes a mes (antes de impuestos)")
         if invoices.empty:
             st.info("No hay facturas clasificadas en esta línea.")
         else:
-            fact_mes = invoices.groupby("mes", as_index=False)["amount_total_signed"].sum()
-            fig = px.bar(fact_mes, x="mes", y="amount_total_signed", text_auto=".2s",
-                         title=f"{linea} — facturación ({anio})",
-                         labels={"amount_total_signed": "COP", "mes": "Mes"})
+            fact_mes = invoices.groupby("mes", as_index=False)[FACT_COL].sum()
+            fig = px.bar(fact_mes, x="mes", y=FACT_COL, text_auto=".2s",
+                         title=f"{linea} — facturación s/imp. ({anio})",
+                         labels={FACT_COL: "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
     with col_b:
         st.markdown("#### 📨 Leads mes a mes")
@@ -258,9 +266,9 @@ def chart_leads_origen(linea: str, leads: pd.DataFrame):
 
 
 def chart_rentabilidad_contable(linea: str):
-    st.markdown("#### 📈 Rentabilidad mensual (facturación − analítica − costo fijo)")
+    st.markdown("#### 📈 Rentabilidad mensual (base imponible − analítica − costo fijo)")
     st.caption(
-        "Facturado − costos de `account.analytic.line` en la cuenta de la línea "
+        "Facturado (base imponible) − costos de `account.analytic.line` en la cuenta de la línea "
         f"({LINEA_ANALYTIC[linea]}) − costo fijo de `data/costos_fijos.csv`."
     )
     if err_costo:
@@ -331,12 +339,16 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     c0, c1, c2, c3, c4 = st.columns(5)
     c0.metric(extra_kpi_label, extra_kpi_value)
     c1.metric("Cumplimiento meta anual", f"{k['pct_cumpl']:.1f}%")
-    c2.metric(f"Vendido en {linea} (año)", fmt_money(k["vendido_anual"]))
-    c3.metric("Facturación acumulada (año)", fmt_money(k["facturado_anual"]))
+    c2.metric(f"Vendido s/imp. en {linea} (año)", fmt_money(k["vendido_anual"]))
+    c3.metric("Facturación s/imp. (año)", fmt_money(k["facturado_anual"]))
     c4.metric("Leads del mes", k["leads_mes"])
     st.caption(
-        '"Vendido" = órdenes confirmadas (`sale.order`). Si el equipo de venta aún no está '
-        "asignado, se clasifica por `service_line` o por la solicitud Staff."
+        f"Todos los pesos son **antes de impuestos**. "
+        f"**Vendido** = `sale.order.amount_untaxed` de OV confirmadas por **Fecha del pedido** "
+        f"(`date_order`). En Odoo: Ventas → Pedidos · Fecha del pedido = {anio} · Confirmado · "
+        f"columna Importe sin impuestos. "
+        f"**Facturado** = `amount_untaxed_signed` de facturas publicadas por **Fecha de factura** "
+        f"(Base imponible; las NC restan)."
     )
     chart_venta_vs_meta(linea, k["sales"])
     chart_fact_y_leads(linea, k["invoices"], k["leads"])
@@ -396,10 +408,17 @@ with tab_resumen:
         column_config={
             "linea": "Línea",
             "meta_anual": st.column_config.NumberColumn("Meta año", format="$%,.0f"),
-            "vendido": st.column_config.NumberColumn("Vendido", format="$%,.0f"),
-            "facturado": st.column_config.NumberColumn("Facturado", format="$%,.0f"),
+            "vendido": st.column_config.NumberColumn("Vendido s/imp.", format="$%,.0f"),
+            "facturado": st.column_config.NumberColumn("Facturado s/imp.", format="$%,.0f"),
             "pct_cumpl": st.column_config.ProgressColumn("% Cumplimiento", format="%.1f%%", min_value=0, max_value=150),
         },
+    )
+    st.caption(
+        f"Montos **antes de impuestos**. Para cuadrar en Odoo · "
+        f"**Vendido:** Ventas → Pedidos · Fecha del pedido = {anio} · Confirmado · "
+        f"Importe sin impuestos. "
+        f"**Facturado:** Facturas de cliente · Fecha de factura = {anio} · Publicadas · "
+        f"**Base imponible**. TRANSFORMACION DIGITAL no entra en este tablero."
     )
 
     # 2. Plazas
@@ -513,28 +532,28 @@ with tab_resumen:
             column_config={
                 "linea": "Línea",
                 "unit_amount": st.column_config.NumberColumn("Horas", format="%.1f"),
-                "vendido": st.column_config.NumberColumn("Vendido", format="$%,.0f"),
-                "cop_por_hora": st.column_config.NumberColumn("COP vendido / hora", format="$%,.0f"),
+                "vendido": st.column_config.NumberColumn("Vendido s/imp.", format="$%,.0f"),
+                "cop_por_hora": st.column_config.NumberColumn("COP s/imp. / hora", format="$%,.0f"),
                 "pct_cumpl": st.column_config.NumberColumn("% meta", format="%.1f%%"),
             },
         )
 
     col_a, col_b = st.columns(2)
     with col_a:
-        if not invoices_all.empty:
+        if not invoices_all.empty and FACT_COL in invoices_all.columns:
             mensual = invoices_all[invoices_all["linea"] != "Sin línea"].groupby(
-                ["mes", "linea"], as_index=False)["amount_total_signed"].sum()
-            fig = px.bar(mensual, x="mes", y="amount_total_signed", color="linea", barmode="group",
-                         title="Facturación mes a mes por línea",
-                         labels={"amount_total_signed": "COP", "mes": "Mes"})
+                ["mes", "linea"], as_index=False)[FACT_COL].sum()
+            fig = px.bar(mensual, x="mes", y=FACT_COL, color="linea", barmode="group",
+                         title="Facturación s/imp. mes a mes por línea",
+                         labels={FACT_COL: "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
     with col_b:
-        if not sales_all.empty:
+        if not sales_all.empty and SALES_COL in sales_all.columns:
             mensual_v = sales_all[sales_all["linea"] != "Sin línea"].groupby(
-                ["mes", "linea"], as_index=False)["amount_total"].sum()
-            fig = px.bar(mensual_v, x="mes", y="amount_total", color="linea", barmode="group",
-                         title="Vendido (OV) mes a mes por línea",
-                         labels={"amount_total": "COP", "mes": "Mes"})
+                ["mes", "linea"], as_index=False)[SALES_COL].sum()
+            fig = px.bar(mensual_v, x="mes", y=SALES_COL, color="linea", barmode="group",
+                         title="Vendido s/imp. (OV) mes a mes por línea",
+                         labels={SALES_COL: "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
 
@@ -888,27 +907,27 @@ with tab_vendedor:
         with st.expander("Detalle de cierres"):
             st.dataframe(cierres.sort_values(["linea", "mes"]), use_container_width=True, hide_index=True)
 
-    st.markdown("#### 🧾 Facturación por vendedor, mes y línea")
-    if fact_vend.empty:
+    st.markdown("#### 🧾 Facturación s/imp. por vendedor, mes y línea")
+    if fact_vend.empty or FACT_COL not in fact_vend.columns:
         st.info("No hay facturas en el período.")
     else:
-        fact_v = fact_vend.groupby(["mes", "vendedor", "linea"], as_index=False)["amount_total_signed"].sum()
-        fig = px.bar(fact_v, x="mes", y="amount_total_signed", color="vendedor", barmode="group", facet_col="linea",
-                     title="Facturación por vendedor, mes y línea",
-                     labels={"amount_total_signed": "COP", "mes": "Mes"})
+        fact_v = fact_vend.groupby(["mes", "vendedor", "linea"], as_index=False)[FACT_COL].sum()
+        fig = px.bar(fact_v, x="mes", y=FACT_COL, color="vendedor", barmode="group", facet_col="linea",
+                     title="Facturación s/imp. por vendedor, mes y línea",
+                     labels={FACT_COL: "COP s/imp.", "mes": "Mes"})
         st.plotly_chart(fig, use_container_width=True)
         with st.expander("Detalle de facturación"):
             st.dataframe(
                 fact_v.sort_values(["linea", "mes"]), use_container_width=True, hide_index=True,
-                column_config={"amount_total_signed": st.column_config.NumberColumn("Facturado", format="$%,.0f")},
+                column_config={FACT_COL: st.column_config.NumberColumn("Facturado s/imp.", format="$%,.0f")},
             )
 
-    st.markdown("#### 📦 Órdenes confirmadas por vendedor, mes y línea")
-    if sales_vend.empty:
+    st.markdown("#### 📦 Órdenes confirmadas por vendedor, mes y línea (s/imp.)")
+    if sales_vend.empty or SALES_COL not in sales_vend.columns:
         st.info("No hay órdenes confirmadas en el período.")
     else:
         ov = sales_vend.groupby(["mes", "vendedor", "linea"], as_index=False).agg(
-            ordenes=("name", "count"), vendido=("amount_total", "sum")
+            ordenes=("name", "count"), vendido=(SALES_COL, "sum")
         )
         fig = px.bar(ov, x="mes", y="ordenes", color="vendedor", barmode="group", facet_col="linea",
                      title="Nº de OV confirmadas por vendedor",
@@ -921,8 +940,8 @@ with st.sidebar.expander("Fuentes Odoo y pendientes"):
         """
 - **Plazas** → `firefly.staffing.request` (fallback: suscripciones)
 - **Renovaciones** → `firefly.staffing.history` (fallback: `sale.order.log`)
-- **Vendido** → `sale.order` confirmadas, clasificadas por equipo / `service_line` / staff
-- **Facturas** → `account.move` + facturas ligadas a esas OV
+- **Vendido** → OV confirmadas por `date_order`, `amount_untaxed` (s/imp.)
+- **Facturas** → publicadas por `invoice_date`, `amount_untaxed_signed` (s/imp.; NC restan)
 - **Leads / origen** → `crm.lead` + `source_id` (equipo CRM)
 - **Cursos/proyectos entregados** → `project.project.service_line` (fecha fin = proxy)
 - **Actividades hechas** → `crm.activity.report`
