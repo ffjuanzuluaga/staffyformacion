@@ -113,29 +113,30 @@ st.sidebar.caption(f"Datos cacheados por 10 min · {datetime.now():%H:%M}")
 teams_df = load_teams()
 metas_lineas = load_metas_lineas()
 costos_fijos = load_costos_fijos()
-team_ids = all_team_ids(teams_df)
+# Primero descubrir equipos (crm.team + fallback desde OV). Luego armar ids.
+resolved_teams = resolve_linea_teams()
+team_ids = [v["id"] for v in resolved_teams.values()]
+if not team_ids:
+    team_ids = all_team_ids(teams_df)
 
 if metas_lineas.empty or (metas_lineas["meta_anual"] == 0).all():
     st.sidebar.warning("Completa `data/metas_lineas.csv` con las metas anuales reales.")
 if not costos_fijos.empty and (costos_fijos["costo_mensual"] == 0).all():
     st.sidebar.info("Los costos fijos de Diego/Paula están en 0. Actualiza `data/costos_fijos.csv` cuando Raquel confirme el valor.")
 
-resolved_teams = resolve_linea_teams()
 missing_teams = [LINEA_TEAM[l] for l in LINEA_TEAM if l not in resolved_teams]
 if missing_teams:
-    st.sidebar.error("No encontré estos equipos en Odoo: " + ", ".join(missing_teams))
-    if not teams_df.empty:
-        st.sidebar.caption("Equipos visibles vía API: " + ", ".join(teams_df["name"].astype(str).tolist()))
-else:
+    st.sidebar.warning(
+        "Aún no se pudo mapear: " + ", ".join(missing_teams) + ". "
+        "Tras cargar OV debería aparecer vía sale.order."
+    )
+if resolved_teams:
     st.sidebar.caption(
         "Equipos mapeados: "
-        + ", ".join(f"{k}→{v['name']} (id={v['id']})" for k, v in resolved_teams.items())
-    )
-# Diagnóstico Fábrica: cuántas OV trae el año para ese equipo
-if "Fábrica de Software" not in resolved_teams:
-    st.sidebar.warning(
-        "Fábrica no resolvió id en crm.team. Las OV se buscan igual por "
-        "`team_id.name =ilike FABRICA SOFTWARE`."
+        + ", ".join(
+            f"{k}→{v['name']} (id={v['id']}, via={v.get('via', '?')})"
+            for k, v in resolved_teams.items()
+        )
     )
 
 d1, d2 = f"{anio}-01-01", f"{anio}-12-31"

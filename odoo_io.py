@@ -203,12 +203,43 @@ def load_teams() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def resolve_linea_teams() -> dict:
-    """Resuelve id de cada equipo por nombre (=ilike) directo en Odoo.
+def discover_teams_from_orders() -> dict:
+    """Descubre equipos desde sale.order.team_id (id + nombre).
 
-    Usa active_test=False. Si crm.team no es visible, las OV igual se traen
-    por team_id.name en load_sales.
+    Evita depender de leer crm.team: el usuario API a veces NO puede
+    search/read el equipo FABRICA SOFTWARE por reglas de CRM, pero sí lee
+    las OV y el many2one trae [id, 'FABRICA SOFTWARE'].
     """
+    try:
+        df = search_read(
+            "sale.order",
+            [("team_id", "!=", False), ("state", "in", ["sale", "done", "draft", "sent"])],
+            ["team_id"],
+            limit=5000,
+        )
+    except Exception:
+        return {}
+    if df.empty or "team_id" not in df.columns:
+        return {}
+    resolved = {}
+    seen = set()
+    for raw in df["team_id"]:
+        if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+            continue
+        tid, tname = int(raw[0]), str(raw[1])
+        if tid in seen:
+            continue
+        seen.add(tid)
+        linea = linea_from_team_name(tname)
+        if linea and linea not in resolved:
+            resolved[linea] = {"id": tid, "name": tname, "active": True, "via": "sale.order"}
+    return resolved
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def resolve_linea_teams() -> dict:
+    """Resuelve id/nombre de cada equipo. Primero crm.team; si falla (reglas
+    de acceso), descubre el equipo desde las OV."""
     resolved = {}
     ctx = {"active_test": False}
     for linea, nombre in LINEA_TEAM.items():
@@ -225,11 +256,12 @@ def resolve_linea_teams() -> dict:
             df = pd.DataFrame()
         if df.empty:
             try:
+                # También por fragmento "FABRICA" / "SOFTWARE"
                 df = search_read(
                     "crm.team",
-                    [("name", "ilike", nombre)],
+                    [("name", "ilike", nombre.split()[0])],
                     ["id", "name", "active"],
-                    limit=10,
+                    limit=20,
                     context=ctx,
                 )
             except Exception:
@@ -238,16 +270,22 @@ def resolve_linea_teams() -> dict:
             target = norm_name(nombre)
             best = None
             for _, row in df.iterrows():
-                if norm_name(row["name"]) == target:
+                if norm_name(row["name"]) == target or linea_from_team_name(row["name"]) == linea:
                     best = row
                     break
-            if best is None:
-                best = df.iloc[0]
-            resolved[linea] = {
-                "id": int(best["id"]),
-                "name": str(best["name"]),
-                "active": bool(best.get("active", True)),
-            }
+            if best is not None:
+                resolved[linea] = {
+                    "id": int(best["id"]),
+                    "name": str(best["name"]),
+                    "active": bool(best.get("active", True)),
+                    "via": "crm.team",
+                }
+
+    # Completar lo que falte (típico: FABRICA SOFTWARE oculto por reglas CRM)
+    from_orders = discover_teams_from_orders()
+    for linea, info in from_orders.items():
+        if linea not in resolved:
+            resolved[linea] = info
     return resolved
 
 
@@ -269,31 +307,6 @@ def team_id_for_linea(teams_df: pd.DataFrame, linea: str) -> int | None:
 
 def all_team_ids(teams_df: pd.DataFrame) -> list[int]:
     return [tid for tid in (team_id_for_linea(teams_df, l) for l in LINEA_TEAM) if tid]
-
-
-def _sales_team_domain(team_ids: list[int]) -> list:
-    """Dominio OR por id de equipo Y por nombre exacto (=ilike).
-
-    El filtro por nombre garantiza traer FABRICA SOFTWARE aunque el id no
-    se haya podido resolver desde crm.team (reglas de acceso / archivado).
-    """
-    clauses: list = []
-    if team_ids:
-        clauses.append(("team_id", "in", team_ids))
-    for nombre in LINEA_TEAM.values():
-        clauses.append(("team_id.name", "=ilike", nombre))
-    # Alias corto por si el nombre en Odoo tiene un sufijo/prefijo raro
-    clauses.append(("team_id.name", "ilike", "FABRICA SOFTWARE"))
-    clauses.append(("team_id.name", "ilike", "Staffing IT"))
-    clauses.append(("team_id.name", "ilike", "FORMACION"))
-    have = available_fields("sale.order")
-    if "service_line" in have:
-        clauses.append(("service_line", "in", list(SERVICE_TO_LINEA)))
-    if "staff_request_id" in have:
-        clauses.append(("staff_request_id", "!=", False))
-    if not clauses:
-        return []
-    return ["|"] * (len(clauses) - 1) + clauses
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -522,18 +535,17 @@ def load_open_pipeline(team_ids: list[int]) -> pd.DataFrame:
 def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
     """OV confirmadas. Montos s/imp. en moneda compañía (COP).
 
-    Dominio simple (fecha + estado + equipo/service_line/staff). La conversión
-    FX es local (amount_untaxed / currency_rate), sin RPC por fila.
+    IMPORTANTE: NO filtramos por team_id / team_id.name en el dominio.
+    Buscar por team_id.name aplica reglas de crm.team y Oculta FABRICA SOFTWARE
+    si el usuario API no puede leer ese equipo. En cambio leemos TODAS las OV
+    confirmadas del período y clasificamos en cliente con el nombre del many2one.
     """
-    base_domain = [
+    del team_ids  # se clasifica por nombre; el id puede no resolverse
+    domain = [
         ("date_order", ">=", date_from),
         ("date_order", "<=", f"{date_to} 23:59:59"),
         ("state", "in", ["sale", "done"]),
     ]
-    # Filtro por id Y por team_id.name (=ilike "FABRICA SOFTWARE", etc.)
-    # para no depender de que crm.team sea visible al usuario API.
-    domain = base_domain + _sales_team_domain(team_ids)
-
     fields = pick_fields(
         "sale.order",
         ["name", "date_order", "partner_id", "user_id", "team_id",
@@ -544,23 +556,10 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     try:
         df = search_read("sale.order", domain, fields, order="date_order")
     except Exception:
-        # Fallback: solo nombres de equipo (sin related fields raros)
         fields = ["name", "date_order", "partner_id", "user_id", "team_id",
                   "amount_untaxed", "amount_total", "currency_id", "currency_rate",
                   "invoice_ids"]
-        name_ors = ["|", "|",
-                    ("team_id.name", "=ilike", "Staffing IT"),
-                    ("team_id.name", "=ilike", "FORMACION"),
-                    ("team_id.name", "=ilike", "FABRICA SOFTWARE")]
-        try:
-            df = search_read("sale.order", base_domain + name_ors, fields, order="date_order")
-        except Exception:
-            df = search_read(
-                "sale.order",
-                base_domain + ([("team_id", "in", team_ids)] if team_ids else []),
-                fields,
-                order="date_order",
-            )
+        df = search_read("sale.order", domain, fields, order="date_order")
 
     if df.empty:
         return df
@@ -573,8 +572,6 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     df["moneda"] = m2o_name(df["currency_id"]) if "currency_id" in df else "COP"
     df["linea"] = classify_linea(df)
 
-    # Conversión a COP: amount_untaxed / currency_rate (convención Odoo).
-    # Si no hay tasa o es 1 con moneda extranjera → se deja el bruto y se marca fx_sin_trm.
     untaxed = pd.to_numeric(df.get("amount_untaxed", 0), errors="coerce").fillna(0.0)
     rate = pd.to_numeric(df["currency_rate"], errors="coerce") if "currency_rate" in df else pd.Series(1.0, index=df.index)
     rate = rate.replace(0, pd.NA).fillna(1.0)
@@ -583,36 +580,37 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     same_cur = cur_ids.isna() | (cur_ids.astype("Int64") == company_cur) if company_cur else cur_ids.isna()
     foreign_without_rate = (~same_cur) & (rate.sub(1.0).abs() < 1e-12)
     df["amount_untaxed_company"] = untaxed.where(same_cur | foreign_without_rate, untaxed / rate)
-    # Si es extranjera sin TRM, amount_untaxed_company = untaxed (USD crudo) + alerta
     df.loc[foreign_without_rate, "amount_untaxed_company"] = untaxed.loc[foreign_without_rate]
     df["fx_sin_trm"] = foreign_without_rate.fillna(False)
 
-    # Mantener solo las 3 líneas; si el filtro deja todo vacío, devolver sin filtrar
-    # (mejor ver "Sin línea" que un tablero en cero por un nombre de equipo raro).
+    # Solo Staff / Formación / Fábrica (TRANSFORMACION DIGITAL y otras quedan fuera)
     filtrado = df[df["linea"].isin(list(LINEA_TEAM))].copy()
-    return filtrado if not filtrado.empty else df.copy()
+    return filtrado
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando facturas...")
 def load_invoices(date_from: str, date_to: str, team_ids: list[int],
                   extra_ids: list[int] | None = None) -> pd.DataFrame:
-    """Facturas posted. Une las del equipo (id o nombre) + las ligadas a OV."""
+    """Facturas posted del período. Sin filtro team_id.name (mismas reglas CRM).
+
+    Clasifica en cliente. Si vienen extra_ids de OV de las 3 líneas, se unen.
+    """
     domain = [
         ("move_type", "in", ["out_invoice", "out_refund"]),
         ("state", "=", "posted"),
         ("invoice_date", ">=", date_from),
         ("invoice_date", "<=", date_to),
     ]
-    team_clauses: list = []
-    if team_ids:
-        team_clauses.append(("team_id", "in", team_ids))
-    for nombre in LINEA_TEAM.values():
-        team_clauses.append(("team_id.name", "=ilike", nombre))
-    team_clauses.append(("team_id.name", "ilike", "FABRICA SOFTWARE"))
-    extra_clause = [("id", "in", extra_ids)] if extra_ids else []
-    all_or = team_clauses + extra_clause
-    if all_or:
-        domain = domain + ["|"] * (len(all_or) - 1) + all_or
+    # Preferir ids resueltos (incluye los descubiertos vía OV) + facturas de esas OV
+    resolved = resolve_linea_teams()
+    ids = list({*(team_ids or []), *(v["id"] for v in resolved.values())})
+    ors: list = []
+    if ids:
+        ors.append(("team_id", "in", ids))
+    if extra_ids:
+        ors.append(("id", "in", extra_ids))
+    if ors:
+        domain = domain + (["|"] * (len(ors) - 1) + ors)
 
     fields = pick_fields(
         "account.move",
@@ -628,7 +626,7 @@ def load_invoices(date_from: str, date_to: str, team_ids: list[int],
     df["vendedor"] = m2o_name(df["invoice_user_id"]) if "invoice_user_id" in df else "Sin asignar"
     df["cliente"] = m2o_name(df["partner_id"])
     df["linea"] = classify_linea(df)
-    return df
+    return df[df["linea"].isin(list(LINEA_TEAM))].copy() if "linea" in df.columns else df
 
 
 def invoice_ids_from_sales(sales: pd.DataFrame) -> list[int]:
