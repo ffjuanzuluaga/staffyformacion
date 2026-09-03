@@ -156,7 +156,7 @@ def m2o_set(series: pd.Series) -> pd.Series:
 def classify_linea(df: pd.DataFrame) -> pd.Series:
     out = pd.Series(pd.NA, index=df.index, dtype="object")
     if "equipo" in df.columns:
-        out = df["equipo"].map(linea_from_team_name)
+        out = df["equipo"].apply(linea_from_team_name)
     if "service_line" in df.columns:
         fill = df["service_line"].map(SERVICE_TO_LINEA)
         out = out.where(out.notna(), fill)
@@ -429,38 +429,22 @@ def load_open_pipeline(team_ids: list[int]) -> pd.DataFrame:
 
 @st.cache_data(ttl=600, show_spinner="Cargando órdenes de venta...")
 def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
-    """OV confirmadas. Montos en moneda de la compañía (COP).
+    """OV confirmadas. Montos s/imp. en moneda compañía (COP).
 
-    No filtramos solo por team_ids resueltos: también traemos por nombre de equipo
-    (ilike) y service_line, para que Fábrica no quede en cero si el match exacto falla.
+    Dominio simple (fecha + estado + equipo/service_line/staff). La conversión
+    FX es local (amount_untaxed / currency_rate), sin RPC por fila.
     """
     have = available_fields("sale.order")
-    base = [
+    base_domain = [
         ("date_order", ">=", date_from),
         ("date_order", "<=", f"{date_to} 23:59:59"),
         ("state", "in", ["sale", "done"]),
     ]
-    # Ampliar OR: ids resueltos + nombres canónicos + service_line + staff
-    name_ors: list = []
-    for team_name in LINEA_TEAM.values():
-        name_ors.append(("team_id.name", "ilike", team_name))
-    # aliases cortos por si el nombre en Odoo varía
-    for alias in ("Staffing", "FORMACION", "FABRICA", "Fábrica", "Fabrica"):
-        name_ors.append(("team_id.name", "ilike", alias))
-
-    clauses: list = []
-    if team_ids:
-        clauses.append(("team_id", "in", team_ids))
-    clauses.extend(name_ors)
-    if "service_line" in have:
-        clauses.append(("service_line", "in", list(SERVICE_TO_LINEA)))
-    if "staff_request_id" in have:
-        clauses.append(("staff_request_id", "!=", False))
-
-    if clauses:
-        domain = base + ["|"] * (len(clauses) - 1) + clauses
-    else:
-        domain = base
+    # Si hay team_ids, filtramos por equipo (y service_line/staff). Si no,
+    # traemos todas las OV confirmadas del año y clasificamos en cliente —
+    # evita tablero en cero cuando falla el match de nombres de equipo.
+    extra = _linea_or_domain(team_ids, have) if team_ids else []
+    domain = base_domain + extra
 
     fields = pick_fields(
         "sale.order",
@@ -469,21 +453,47 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
          "company_id", "service_line", "staff_request_id",
          "invoice_ids", "opportunity_id"],
     )
-    df = search_read("sale.order", domain, fields, order="date_order")
+    try:
+        df = search_read("sale.order", domain, fields, order="date_order")
+    except Exception:
+        fields = ["name", "date_order", "partner_id", "user_id", "team_id",
+                  "amount_untaxed", "amount_total", "invoice_ids"]
+        df = search_read(
+            "sale.order",
+            base_domain + ([("team_id", "in", team_ids)] if team_ids else []),
+            fields,
+            order="date_order",
+        )
+
     if df.empty:
         return df
+
     df["date_order"] = pd.to_datetime(df["date_order"])
     df["mes"] = df["date_order"].dt.to_period("M").astype(str)
-    df["vendedor"] = m2o_name(df["user_id"])
-    df["equipo"] = m2o_name(df["team_id"])
-    df["cliente"] = m2o_name(df["partner_id"])
+    df["vendedor"] = m2o_name(df["user_id"]) if "user_id" in df else "Sin asignar"
+    df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
+    df["cliente"] = m2o_name(df["partner_id"]) if "partner_id" in df else "Sin asignar"
     df["moneda"] = m2o_name(df["currency_id"]) if "currency_id" in df else "COP"
     df["linea"] = classify_linea(df)
-    company_amt, fx_alert = amount_untaxed_company_series(df)
-    df["amount_untaxed_company"] = company_amt
-    df["fx_sin_trm"] = fx_alert
-    # Solo las 3 líneas del tablero (excluye TRANSFORMACION DIGITAL, etc.)
-    return df[df["linea"].isin(list(LINEA_TEAM))].copy()
+
+    # Conversión a COP: amount_untaxed / currency_rate (convención Odoo).
+    # Si no hay tasa o es 1 con moneda extranjera → se deja el bruto y se marca fx_sin_trm.
+    untaxed = pd.to_numeric(df.get("amount_untaxed", 0), errors="coerce").fillna(0.0)
+    rate = pd.to_numeric(df["currency_rate"], errors="coerce") if "currency_rate" in df else pd.Series(1.0, index=df.index)
+    rate = rate.replace(0, pd.NA).fillna(1.0)
+    company_cur = company_currency_id()
+    cur_ids = m2o_id(df["currency_id"]) if "currency_id" in df else pd.Series([None] * len(df), index=df.index)
+    same_cur = cur_ids.isna() | (cur_ids.astype("Int64") == company_cur) if company_cur else cur_ids.isna()
+    foreign_without_rate = (~same_cur) & (rate.sub(1.0).abs() < 1e-12)
+    df["amount_untaxed_company"] = untaxed.where(same_cur | foreign_without_rate, untaxed / rate)
+    # Si es extranjera sin TRM, amount_untaxed_company = untaxed (USD crudo) + alerta
+    df.loc[foreign_without_rate, "amount_untaxed_company"] = untaxed.loc[foreign_without_rate]
+    df["fx_sin_trm"] = foreign_without_rate.fillna(False)
+
+    # Mantener solo las 3 líneas; si el filtro deja todo vacío, devolver sin filtrar
+    # (mejor ver "Sin línea" que un tablero en cero por un nombre de equipo raro).
+    filtrado = df[df["linea"].isin(list(LINEA_TEAM))].copy()
+    return filtrado if not filtrado.empty else df.copy()
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando facturas...")

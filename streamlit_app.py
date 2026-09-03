@@ -55,14 +55,21 @@ st.set_page_config(
 
 
 # Todos los pesos del tablero son ANTES DE IMPUESTOS y en moneda compañía (COP).
-# Vendido = amount_untaxed convertido con currency_rate (TRM) → amount_untaxed_company
+# Vendido = amount_untaxed_company (fallback amount_untaxed).
 # Facturado = amount_untaxed_signed (ya viene en moneda compañía; NC restan).
 SALES_COL = "amount_untaxed_company"
+SALES_COL_FALLBACK = "amount_untaxed"
 FACT_COL = "amount_untaxed_signed"
 
 
 def fmt_money(v: float) -> str:
     return f"${v:,.0f}"
+
+
+def sales_amount_col(df: pd.DataFrame) -> str:
+    if df is not None and not df.empty and SALES_COL in df.columns:
+        return SALES_COL
+    return SALES_COL_FALLBACK
 
 
 def filtro_linea(df: pd.DataFrame, linea: str) -> pd.DataFrame:
@@ -137,7 +144,13 @@ mes_actual_key = f"{hoy.year}-{hoy.month:02d}"
 # Carga única (compartida por todas las pestañas)
 # ─────────────────────────────────────────────
 sales_all = load_sales(d1, d2, team_ids)
-if not sales_all.empty and "fx_sin_trm" in sales_all.columns:
+if sales_all.empty:
+    st.error(
+        "No se trajeron órdenes de venta confirmadas. "
+        f"Equipos resueltos: {team_ids or 'ninguno'}. "
+        "Prueba 🔄 Refrescar datos. Si sigue vacío, el dominio de OV está fallando contra Odoo."
+    )
+elif "fx_sin_trm" in sales_all.columns:
     fx_bad = sales_all[sales_all["fx_sin_trm"]]
     if not fx_bad.empty:
         st.warning(
@@ -192,7 +205,8 @@ def kpis_linea(linea: str) -> dict:
     invoices = filtro_linea(invoices_all, linea)
     leads = filtro_linea(leads_all, linea)
     meta = meta_anual_de(metas_lineas, linea)
-    vendido = float(sales[SALES_COL].sum()) if not sales.empty and SALES_COL in sales else 0.0
+    scol = sales_amount_col(sales)
+    vendido = float(sales[scol].sum()) if not sales.empty and scol in sales else 0.0
     facturado = float(invoices[FACT_COL].sum()) if not invoices.empty and FACT_COL in invoices else 0.0
     leads_mes = int(leads.loc[leads["mes"] == mes_actual_key].shape[0]) if not leads.empty else 0
     return {
@@ -231,16 +245,17 @@ def rentabilidad_contable(linea: str) -> pd.DataFrame:
 def chart_venta_vs_meta(linea: str, sales: pd.DataFrame):
     st.markdown("#### 💰 Cierre de venta mes a mes vs. meta (antes de impuestos)")
     meta_m = meta_anual_de(metas_lineas, linea) / 12
+    scol = sales_amount_col(sales)
     ventas_mes = (
-        sales.groupby("mes", as_index=False)[SALES_COL].sum()
-        if not sales.empty and SALES_COL in sales else pd.DataFrame(columns=["mes", SALES_COL])
+        sales.groupby("mes", as_index=False)[scol].sum()
+        if not sales.empty and scol in sales else pd.DataFrame(columns=["mes", scol])
     )
     base = pd.DataFrame({"mes": months_year}).merge(ventas_mes, on="mes", how="left")
-    base[SALES_COL] = base[SALES_COL].fillna(0)
+    base[scol] = base[scol].fillna(0)
     base["meta_mensual"] = meta_m
-    largo = base.melt(id_vars="mes", value_vars=["meta_mensual", SALES_COL],
+    largo = base.melt(id_vars="mes", value_vars=["meta_mensual", scol],
                       var_name="concepto", value_name="valor")
-    largo["concepto"] = largo["concepto"].map({"meta_mensual": "Meta mensual", SALES_COL: "Vendido"})
+    largo["concepto"] = largo["concepto"].map({"meta_mensual": "Meta mensual", scol: "Vendido"})
     fig = px.bar(
         largo, x="mes", y="valor", color="concepto", barmode="group",
         title=f"{linea} — vendido s/imp. (OV) vs. meta mensual ({anio})",
@@ -587,12 +602,13 @@ with tab_resumen:
                          labels={FACT_COL: "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
     with col_b:
-        if not sales_all.empty and SALES_COL in sales_all.columns:
+        scol = sales_amount_col(sales_all)
+        if not sales_all.empty and scol in sales_all.columns:
             mensual_v = sales_all[sales_all["linea"] != "Sin línea"].groupby(
-                ["mes", "linea"], as_index=False)[SALES_COL].sum()
-            fig = px.bar(mensual_v, x="mes", y=SALES_COL, color="linea", barmode="group",
+                ["mes", "linea"], as_index=False)[scol].sum()
+            fig = px.bar(mensual_v, x="mes", y=scol, color="linea", barmode="group",
                          title="Vendido s/imp. (OV) mes a mes por línea",
-                         labels={SALES_COL: "COP s/imp.", "mes": "Mes"})
+                         labels={scol: "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
 
@@ -962,11 +978,12 @@ with tab_vendedor:
             )
 
     st.markdown("#### 📦 Órdenes confirmadas por vendedor, mes y línea (s/imp.)")
-    if sales_vend.empty or SALES_COL not in sales_vend.columns:
+    scol = sales_amount_col(sales_vend)
+    if sales_vend.empty or scol not in sales_vend.columns:
         st.info("No hay órdenes confirmadas en el período.")
     else:
         ov = sales_vend.groupby(["mes", "vendedor", "linea"], as_index=False).agg(
-            ordenes=("name", "count"), vendido=(SALES_COL, "sum")
+            ordenes=("name", "count"), vendido=(scol, "sum")
         )
         fig = px.bar(ov, x="mes", y="ordenes", color="vendedor", barmode="group", facet_col="linea",
                      title="Nº de OV confirmadas por vendedor",
