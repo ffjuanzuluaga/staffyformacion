@@ -19,6 +19,7 @@ from odoo_io import (
     LINEA_TEAM,
     all_team_ids,
     es_tipo_comercial,
+    gate_lineas_tablero,
     invoice_ids_from_sales,
     load_activity_report,
     load_analytic_costs,
@@ -176,17 +177,38 @@ else:
         .agg(ov=("name", "count"), vendido=(sales_amount_col(sales_all), "sum"))
         if group_cols else pd.DataFrame()
     )
+    excl_ov = sales_all.attrs.get("excluidas_ov", 0)
+    excl_monto = sales_all.attrs.get("excluidas_monto", 0.0)
+    excl_equipos = sales_all.attrs.get("excluidas_equipos") or {}
+    if excl_ov:
+        st.sidebar.info(
+            f"Excluidas del tablero: **{excl_ov} OV** "
+            f"({fmt_money(excl_monto)}) — {', '.join(excl_equipos) or 'otros equipos'}."
+        )
     with st.sidebar.expander("OV cargadas por equipo (debug)"):
         if por_equipo.empty:
             st.caption("Sin desglose.")
         else:
             st.dataframe(por_equipo, use_container_width=True, hide_index=True)
+            if excl_equipos:
+                st.caption("Fuera del tablero (no suman a Formación/Staff/Fábrica):")
+                st.json(excl_equipos)
             mask = por_equipo["equipo"].astype(str).str.contains("FABRICA", case=False, na=False)
             if "linea" in por_equipo.columns:
                 mask = mask | (por_equipo["linea"] == "Fábrica de Software")
             if "equipo_id" in por_equipo.columns:
                 mask = mask | (pd.to_numeric(por_equipo["equipo_id"], errors="coerce") == 4)
             fabs = por_equipo[mask]
+            form_mask = por_equipo["equipo"].astype(str).str.upper() == "FORMACION"
+            if "equipo_id" in por_equipo.columns:
+                form_mask = form_mask | (pd.to_numeric(por_equipo["equipo_id"], errors="coerce") == 6)
+            formacion_solo = por_equipo[form_mask]
+            if not formacion_solo.empty:
+                st.caption(
+                    f"Formación solo equipo FORMACION: "
+                    f"{int(formacion_solo['ov'].sum())} OV / "
+                    f"{fmt_money(float(formacion_solo['vendido'].sum()))}"
+                )
             if fabs.empty:
                 st.error("Ninguna OV de Fábrica (nombre FABRICA, línea o team_id=4).")
             else:
@@ -210,17 +232,23 @@ leads_all = load_leads_full(d1, d2, team_ids)
 pipeline = load_open_pipeline(team_ids)
 inv_extra = invoice_ids_from_sales(sales_all)
 invoices_all = load_invoices(d1, d2, team_ids, extra_ids=inv_extra or None)
-# Reclasificar facturas sin equipo usando la OV de origen
+# Reclasificar facturas sin equipo usando la OV de origen (solo las 3 líneas)
 if not invoices_all.empty and not sales_all.empty and "invoice_ids" in sales_all.columns:
     so_linea = {}
     for _, row in sales_all.iterrows():
+        linea_so = row.get("linea")
+        if linea_so not in LINEA_TEAM:
+            continue
         for iid in (row.get("invoice_ids") or []):
-            so_linea[int(iid)] = row["linea"]
+            so_linea[int(iid)] = linea_so
     if so_linea and "id" in invoices_all.columns:
         from_so = invoices_all["id"].map(so_linea)
         invoices_all["linea"] = invoices_all["linea"].where(
             invoices_all["linea"] != "Sin línea", from_so
         ).fillna(invoices_all["linea"])
+        # Por si alguna factura quedó con equipo TRANSFORMACION DIGITAL
+        if "equipo_id" in invoices_all.columns or "equipo" in invoices_all.columns:
+            invoices_all = gate_lineas_tablero(invoices_all)
 
 costos_analytic, err_costo = load_analytic_costs(d1, d2)
 staff_req, err_staff = load_staffing_requests()

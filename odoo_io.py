@@ -65,6 +65,12 @@ OTHER_TEAMS_NORM = {
     "transformaciondigital",
     "transformacion",
 }
+# id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
+OTHER_TEAM_IDS = {5}
+# Solo estos team_id entran al tablero (Fábrica=4, Formación=6, Staff=11).
+ALLOWED_TEAM_IDS = set(TEAM_ID_HINTS.keys())
+# Bust de caché Streamlit cuando cambia la lógica de clasificación.
+_DATA_VERSION = 4
 
 
 def norm_name(value) -> str:
@@ -219,28 +225,61 @@ def _team_id_linea_lookup(extra: dict | None = None) -> dict:
         pass
     if extra:
         mapping.update({int(k): v for k, v in extra.items()})
-    return mapping
+    # Nunca mapear TRANSFORMACION DIGITAL ni ids fuera de las 3 líneas
+    return {
+        int(k): v for k, v in mapping.items()
+        if int(k) in ALLOWED_TEAM_IDS and int(k) not in OTHER_TEAM_IDS
+    }
+
+
+def _mask_equipo_excluido(df: pd.DataFrame) -> pd.Series:
+    """True = equipo fuera del tablero (p.ej. TRANSFORMACION DIGITAL)."""
+    excl = pd.Series(False, index=df.index)
+    if "equipo" in df.columns:
+        excl = excl | df["equipo"].apply(es_equipo_otra_linea)
+    ids = None
+    if "equipo_id" in df.columns:
+        ids = pd.to_numeric(df["equipo_id"], errors="coerce")
+    elif "team_id" in df.columns:
+        ids = pd.to_numeric(m2o_id(df["team_id"]), errors="coerce")
+    if ids is not None:
+        has_team = ids.notna()
+        excl = excl | ids.isin(list(OTHER_TEAM_IDS))
+        # Cualquier otro team_id distinto de 4/6/11 queda fuera
+        excl = excl | (has_team & ~ids.isin(list(ALLOWED_TEAM_IDS)))
+    return excl.fillna(False)
 
 
 def classify_linea(df: pd.DataFrame, team_id_to_linea: dict | None = None) -> pd.Series:
     out = pd.Series(pd.NA, index=df.index, dtype="object")
-    other = pd.Series(False, index=df.index)
+    other = _mask_equipo_excluido(df)
     if "equipo" in df.columns:
         out = df["equipo"].apply(linea_from_team_name)
-        other = df["equipo"].apply(es_equipo_otra_linea)
     mapping = _team_id_linea_lookup(team_id_to_linea)
     if mapping and "team_id" in df.columns:
         ids = m2o_id(df["team_id"])
         by_id = ids.map(lambda i: mapping.get(int(i)) if pd.notna(i) and i is not None else None)
-        out = out.where(out.notna(), by_id)
-    # No rescatar TRANSFORMACION DIGITAL (ni similares) vía service_line / staffing
+        # No rellenar filas de equipos excluidos
+        out = out.where(out.notna() | other, by_id)
     if "service_line" in df.columns:
         fill = df["service_line"].map(SERVICE_TO_LINEA)
         out = out.where(out.notna() | other, fill)
     if "staff_request_id" in df.columns:
         has_staff = m2o_set(df["staff_request_id"])
         out = out.mask(out.isna() & ~other & has_staff, "Staff")
+    out = out.mask(other, pd.NA)
     return out.fillna("Sin línea")
+
+
+def gate_lineas_tablero(df: pd.DataFrame) -> pd.DataFrame:
+    """Filtra al tablero y anula línea de equipos excluidos (defensa en profundidad)."""
+    if df is None or df.empty or "linea" not in df.columns:
+        return df if df is not None else pd.DataFrame()
+    out = df.copy()
+    excl = _mask_equipo_excluido(out)
+    if excl.any():
+        out.loc[excl, "linea"] = "Sin línea"
+    return out[out["linea"].isin(list(LINEA_TEAM))].copy()
 
 
 def month_list(start: str, n: int) -> list[str]:
@@ -672,15 +711,17 @@ def load_open_pipeline(team_ids: list[int]) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando órdenes de venta...")
-def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+def load_sales(date_from: str, date_to: str, team_ids: list[int],
+               _v: int = _DATA_VERSION) -> pd.DataFrame:
     """OV confirmadas. Montos s/imp. en moneda compañía (COP).
 
     IMPORTANTE: NO filtramos por team_id / team_id.name en el dominio.
     Buscar por team_id.name aplica reglas de crm.team y Oculta FABRICA SOFTWARE
     si el usuario API no puede leer ese equipo. En cambio leemos TODAS las OV
     confirmadas del período y clasificamos en cliente con el nombre del many2one.
+    Solo pasan al tablero team_id ∈ {4,6,11} (o sin equipo + service_line).
     """
-    del team_ids  # se clasifica por nombre; el id puede no resolverse
+    del team_ids, _v
     domain = [
         ("date_order", ">=", date_from),
         ("date_order", "<=", f"{date_to} 23:59:59"),
@@ -724,27 +765,49 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     df.loc[foreign_without_rate, "amount_untaxed_company"] = untaxed.loc[foreign_without_rate]
     df["fx_sin_trm"] = foreign_without_rate.fillna(False)
 
-    # Solo Staff / Formación / Fábrica (TRANSFORMACION DIGITAL y otras quedan fuera)
-    filtrado = df[df["linea"].isin(list(LINEA_TEAM))].copy()
-    return filtrado
+    excl = _mask_equipo_excluido(df)
+    meta = {}
+    if excl.any():
+        scol = "amount_untaxed_company" if "amount_untaxed_company" in df.columns else "amount_untaxed"
+        meta = {
+            "excluidas_ov": int(excl.sum()),
+            "excluidas_monto": float(pd.to_numeric(df.loc[excl, scol], errors="coerce").fillna(0).sum()),
+            "excluidas_equipos": (
+                df.loc[excl].groupby(df.loc[excl, "equipo"].astype(str))[scol]
+                .sum()
+                .round(0)
+                .astype(int)
+                .to_dict()
+                if "equipo" in df.columns else {}
+            ),
+        }
+    out = gate_lineas_tablero(df)
+    out.attrs.update(meta)
+    return out
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando facturas...")
 def load_invoices(date_from: str, date_to: str, team_ids: list[int],
-                  extra_ids: list[int] | None = None) -> pd.DataFrame:
+                  extra_ids: list[int] | None = None,
+                  _v: int = _DATA_VERSION) -> pd.DataFrame:
     """Facturas posted del período. Sin filtro team_id.name (mismas reglas CRM).
 
     Clasifica en cliente. Si vienen extra_ids de OV de las 3 líneas, se unen.
+    Solo team_id ∈ {4,6,11} (u OV de esas líneas sin equipo en la factura).
     """
+    del _v
     domain = [
         ("move_type", "in", ["out_invoice", "out_refund"]),
         ("state", "=", "posted"),
         ("invoice_date", ">=", date_from),
         ("invoice_date", "<=", date_to),
     ]
-    # Preferir ids resueltos (incluye los descubiertos vía OV) + facturas de esas OV
+    # Solo ids de las 3 líneas — nunca TRANSFORMACION DIGITAL (5)
     resolved = resolve_linea_teams()
-    ids = list({*(team_ids or []), *(v["id"] for v in resolved.values())})
+    ids = list({
+        tid for tid in (*(team_ids or []), *(v["id"] for v in resolved.values()))
+        if tid in ALLOWED_TEAM_IDS and tid not in OTHER_TEAM_IDS
+    })
     ors: list = []
     if ids:
         ors.append(("team_id", "in", ids))
@@ -764,10 +827,11 @@ def load_invoices(date_from: str, date_to: str, team_ids: list[int],
     df["invoice_date"] = pd.to_datetime(df["invoice_date"])
     df["mes"] = df["invoice_date"].dt.to_period("M").astype(str)
     df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
+    df["equipo_id"] = m2o_id(df["team_id"]) if "team_id" in df else None
     df["vendedor"] = m2o_name(df["invoice_user_id"]) if "invoice_user_id" in df else "Sin asignar"
     df["cliente"] = m2o_name(df["partner_id"])
     df["linea"] = classify_linea(df)
-    return df[df["linea"].isin(list(LINEA_TEAM))].copy() if "linea" in df.columns else df
+    return gate_lineas_tablero(df)
 
 
 def invoice_ids_from_sales(sales: pd.DataFrame) -> list[int]:
