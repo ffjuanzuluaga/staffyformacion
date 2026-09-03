@@ -59,6 +59,13 @@ TEAM_ALIASES_NORM = {
     "fabricasw": "Fábrica de Software",
 }
 
+# Equipos CRM que no son las 3 líneas (no usar service_line como fallback).
+# "formacion" es subcadena de "transformacion" — no mezclar esas OV/facturas.
+OTHER_TEAMS_NORM = {
+    "transformaciondigital",
+    "transformacion",
+}
+
 
 def norm_name(value) -> str:
     """Normaliza para comparar nombres de equipo/cuenta: minúsculas, sin tildes ni espacios."""
@@ -89,16 +96,23 @@ def linea_from_team_name(nombre: str) -> str | None:
     alias = TEAM_ALIASES_NORM.get(n)
     if alias:
         return alias
-    # Último recurso: si el nombre contiene FABRICA / FORMACION / STAFFING
+    if n in OTHER_TEAMS_NORM or n.startswith("transformacion"):
+        return None
+    # Último recurso: token propio, no subcadena (transformacion ≠ formacion)
     if "fabrica" in n and "software" in n:
         return "Fábrica de Software"
     if n.startswith("fabrica"):
         return "Fábrica de Software"
-    if "formacion" in n:
+    if n.startswith("formacion"):
         return "Formación"
     if "staffing" in n or n == "staff":
         return "Staff"
     return None
+
+
+def es_equipo_otra_linea(nombre) -> bool:
+    n = norm_name(nombre)
+    return bool(n) and (n in OTHER_TEAMS_NORM or n.startswith("transformacion"))
 
 STAFF_ACTIVE_STATES = ("confirmed",)
 STAFF_COVERAGE_STATES = ("confirmed", "done")
@@ -210,19 +224,22 @@ def _team_id_linea_lookup(extra: dict | None = None) -> dict:
 
 def classify_linea(df: pd.DataFrame, team_id_to_linea: dict | None = None) -> pd.Series:
     out = pd.Series(pd.NA, index=df.index, dtype="object")
+    other = pd.Series(False, index=df.index)
     if "equipo" in df.columns:
         out = df["equipo"].apply(linea_from_team_name)
+        other = df["equipo"].apply(es_equipo_otra_linea)
     mapping = _team_id_linea_lookup(team_id_to_linea)
     if mapping and "team_id" in df.columns:
         ids = m2o_id(df["team_id"])
         by_id = ids.map(lambda i: mapping.get(int(i)) if pd.notna(i) and i is not None else None)
         out = out.where(out.notna(), by_id)
+    # No rescatar TRANSFORMACION DIGITAL (ni similares) vía service_line / staffing
     if "service_line" in df.columns:
         fill = df["service_line"].map(SERVICE_TO_LINEA)
-        out = out.where(out.notna(), fill)
+        out = out.where(out.notna() | other, fill)
     if "staff_request_id" in df.columns:
         has_staff = m2o_set(df["staff_request_id"])
-        out = out.mask(out.isna() & has_staff, "Staff")
+        out = out.mask(out.isna() & ~other & has_staff, "Staff")
     return out.fillna("Sin línea")
 
 
