@@ -17,6 +17,7 @@ import streamlit as st
 from odoo_io import (
     LINEA_ANALYTIC,
     LINEA_TEAM,
+    _DATA_VERSION,
     all_team_ids,
     es_tipo_comercial,
     gate_lineas_tablero,
@@ -109,7 +110,9 @@ if st.sidebar.button("🔄 Refrescar datos"):
     st.cache_data.clear()
     st.rerun()
 
-st.sidebar.caption(f"Datos cacheados por 10 min · {datetime.now():%H:%M}")
+st.sidebar.caption(
+    f"Datos cacheados por 10 min · {datetime.now():%H:%M} · clasif. v{_DATA_VERSION}"
+)
 
 teams_df = load_teams()
 metas_lineas = load_metas_lineas()

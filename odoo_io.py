@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación.
-_DATA_VERSION = 5
+_DATA_VERSION = 6
 
 
 def allowed_team_ids() -> set[int]:
@@ -235,37 +235,39 @@ def _team_id_linea_lookup(extra: dict | None = None) -> dict:
         pass
     if extra:
         mapping.update({int(k): v for k, v in extra.items()})
-    allowed = allowed_team_ids()
     other = set(OTHER_TEAM_IDS)
-    return {
-        int(k): v for k, v in mapping.items()
-        if int(k) not in other and (not allowed or int(k) in allowed)
-    }
+    # Incluir todos los ids resueltos de las 3 líneas (1/6/11 hoy; no filtrar por set fijo)
+    return {int(k): v for k, v in mapping.items() if int(k) not in other}
 
 
 def _mask_equipo_excluido(df: pd.DataFrame) -> pd.Series:
-    """True = equipo fuera del tablero (p.ej. TRANSFORMACION DIGITAL).
+    """True solo para TRANSFORMACION DIGITAL (u homólogos).
 
-    Nunca excluye un equipo cuyo nombre mapea a Staff/Formación/Fábrica
-    (evita tumbar FABRICA SOFTWARE si cambió de id 4→1).
+    No usa allowlist de ids: eso excluía FABRICA SOFTWARE cuando pasó de id=4 a id=1.
+    Las OV de otros equipos quedan en «Sin línea» vía classify, sin tumbar Fábrica.
     """
-    is_tablero = pd.Series(False, index=df.index)
-    is_other_name = pd.Series(False, index=df.index)
+    excl = pd.Series(False, index=df.index)
     if "equipo" in df.columns:
-        is_other_name = df["equipo"].apply(es_equipo_otra_linea)
-        is_tablero = df["equipo"].apply(linea_from_team_name).isin(list(LINEA_TEAM))
-    excl = is_other_name.copy()
+        excl = df["equipo"].apply(es_equipo_otra_linea)
     ids = None
     if "equipo_id" in df.columns:
         ids = pd.to_numeric(df["equipo_id"], errors="coerce")
     elif "team_id" in df.columns:
         ids = pd.to_numeric(m2o_id(df["team_id"]), errors="coerce")
     if ids is not None:
-        allowed = allowed_team_ids()
         excl = excl | ids.isin(list(OTHER_TEAM_IDS))
+    # Cinturón: las 3 líneas del tablero nunca se marcan excluidas
+    if "equipo" in df.columns:
+        is_tablero = df["equipo"].apply(linea_from_team_name).isin(list(LINEA_TEAM))
+        excl = excl & ~is_tablero
+    if ids is not None:
+        try:
+            allowed = allowed_team_ids()
+        except Exception:
+            allowed = set(TEAM_ID_HINTS.keys())
         if allowed:
-            excl = excl | (ids.notna() & ~ids.isin(list(allowed)) & ~is_tablero)
-    return (excl & ~is_tablero).fillna(False)
+            excl = excl & ~ids.isin(list(allowed))
+    return excl.fillna(False)
 
 
 def classify_linea(df: pd.DataFrame, team_id_to_linea: dict | None = None) -> pd.Series:
