@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación.
-_DATA_VERSION = 8
+_DATA_VERSION = 9
 
 
 def allowed_team_ids() -> set[int]:
@@ -275,11 +275,18 @@ def classify_linea(df: pd.DataFrame, team_id_to_linea: dict | None = None) -> pd
     other = _mask_equipo_excluido(df)
     if "equipo" in df.columns:
         out = df["equipo"].apply(linea_from_team_name)
+        # Nunca mapear TRANSFORMACION* a Formación (ni por service_line)
+        other = other | df["equipo"].apply(es_equipo_otra_linea)
     mapping = _team_id_linea_lookup(team_id_to_linea)
-    if mapping and "team_id" in df.columns:
+    ids = None
+    if "team_id" in df.columns:
         ids = m2o_id(df["team_id"])
+    elif "equipo_id" in df.columns:
+        ids = pd.to_numeric(df["equipo_id"], errors="coerce")
+    if ids is not None:
+        other = other | ids.isin(list(OTHER_TEAM_IDS))
+    if mapping is not None and ids is not None:
         by_id = ids.map(lambda i: mapping.get(int(i)) if pd.notna(i) and i is not None else None)
-        # No rellenar filas de equipos excluidos
         out = out.where(out.notna() | other, by_id)
     if "service_line" in df.columns:
         fill = df["service_line"].map(SERVICE_TO_LINEA)
@@ -297,6 +304,10 @@ def gate_lineas_tablero(df: pd.DataFrame) -> pd.DataFrame:
         return df if df is not None else pd.DataFrame()
     out = df.copy()
     excl = _mask_equipo_excluido(out)
+    if "equipo" in out.columns:
+        excl = excl | out["equipo"].apply(es_equipo_otra_linea)
+    if "equipo_id" in out.columns:
+        excl = excl | pd.to_numeric(out["equipo_id"], errors="coerce").isin(list(OTHER_TEAM_IDS))
     if excl.any():
         out.loc[excl, "linea"] = "Sin línea"
     return out[out["linea"].isin(list(LINEA_TEAM))].copy()
