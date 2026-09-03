@@ -120,6 +120,10 @@ def m2o_name(series: pd.Series) -> pd.Series:
     return series.apply(lambda v: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 else "Sin asignar")
 
 
+def m2o_id(series: pd.Series) -> pd.Series:
+    return series.apply(lambda v: v[0] if isinstance(v, (list, tuple)) else None)
+
+
 # ─────────────────────────────────────────────
 # Carga de datos (cacheada 10 min)
 # ─────────────────────────────────────────────
@@ -148,7 +152,7 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     df = search_read(
         "crm.lead", domain,
         ["name", "create_date", "date_closed", "user_id", "team_id", "source_id",
-         "expected_revenue", "probability", "active", "type"],
+         "expected_revenue", "probability", "active", "type", "won_status"],
         order="create_date",
     )
     if df.empty:
@@ -158,20 +162,20 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     df["vendedor"] = m2o_name(df["user_id"])
     df["equipo"] = m2o_name(df["team_id"])
     df["origen"] = m2o_name(df["source_id"])
-    df["estado"] = df.apply(
-        lambda r: "Ganada" if r["probability"] == 100 else ("Perdida" if not r["active"] else "Abierta"),
-        axis=1,
-    )
+    df["estado"] = df["won_status"].map({"won": "Ganada", "lost": "Perdida", "pending": "Abierta"})
     return df
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas...")
 def load_won(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
     """Oportunidades GANADAS con fecha de cierre en el período (para
-    "cierre de venta mes a mes" — sale del CRM, no de facturación)."""
+    "cierre de venta mes a mes" — sale del CRM, no de facturación).
+    GANADA = won_status == 'won' (probability 100 Y stage_id.is_won — el campo
+    real de Odoo, confirmado en odoo/addons/crm/models/crm_lead.py; más estricto
+    que solo probability == 100)."""
     domain = [
         ("type", "=", "opportunity"),
-        ("probability", "=", 100),
+        ("won_status", "=", "won"),
         ("date_closed", ">=", date_from),
         ("date_closed", "<=", f"{date_to} 23:59:59"),
     ]
@@ -323,6 +327,54 @@ def load_analytic_hours(date_from: str, date_to: str):
     df["mes"] = df["date"].dt.to_period("M").astype(str)
     df["linea"] = m2o_name(df["account_id"]).map(ANALYTIC_TO_LINEA).fillna("Sin línea")
     df["persona"] = m2o_name(df["employee_id"])
+    return df, None
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando vendedores de los equipos de venta...")
+def load_sales_team_employees(team_ids: list[int]) -> pd.DataFrame:
+    """Empleados (hr.employee) que son vendedores (member_ids, res.users) de
+    los equipos de venta dados — para acotar las horas por proyecto solo a
+    estas personas, no a todo el equipo de delivery/consultoría."""
+    cols = ["employee_id", "user_id", "vendedor"]
+    if not team_ids:
+        return pd.DataFrame(columns=cols)
+    teams = search_read("crm.team", [("id", "in", team_ids)], ["id", "member_ids"])
+    if teams.empty:
+        return pd.DataFrame(columns=cols)
+    user_ids = sorted({uid for ids in teams["member_ids"] for uid in (ids or [])})
+    if not user_ids:
+        return pd.DataFrame(columns=cols)
+    emp = search_read("hr.employee", [("user_id", "in", user_ids)], ["id", "user_id", "name"])
+    if emp.empty:
+        return pd.DataFrame(columns=cols)
+    emp["user_id"] = m2o_id(emp["user_id"])
+    return emp.rename(columns={"id": "employee_id", "name": "vendedor"})[cols]
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando horas por proyecto...")
+def load_hours_by_project(date_from: str, date_to: str, employee_ids: list[int]):
+    """Horas (timesheets, unit_amount > 0) por PROYECTO (project.project) —
+    no por tarea — empleado y mes. Para el "Top 5 de proyectos" que pidió
+    Raquel: monitorear en qué se va el tiempo del equipo comercial, mes a
+    mes, para ver si la carga está alineada con lo comercial/operativo."""
+    cols = ["date", "unit_amount", "project_id", "employee_id"]
+    domain = [
+        ("date", ">=", date_from), ("date", "<=", date_to),
+        ("unit_amount", ">", 0),
+        ("project_id", "!=", False),
+    ]
+    if employee_ids:
+        domain.append(("employee_id", "in", employee_ids))
+    try:
+        df = search_read("account.analytic.line", domain, cols)
+    except Exception as e:
+        return pd.DataFrame(columns=cols), f"No se pudo consultar horas por proyecto (account.analytic.line.project_id): {e}"
+    if df.empty:
+        return df, None
+    df["date"] = pd.to_datetime(df["date"])
+    df["mes"] = df["date"].dt.to_period("M").astype(str)
+    df["proyecto"] = m2o_name(df["project_id"])
+    df["vendedor"] = m2o_name(df["employee_id"])
     return df, None
 
 
@@ -747,6 +799,8 @@ with tab_fabrica:
 
 # --- Equipo (horas y actividades) -----------------------------------------
 with tab_equipo:
+    team_ids_equipo = [tid for tid in (team_id_for_linea(teams_df, l) for l in LINEA_TEAM) if tid]
+
     st.markdown("#### ⏱️ Horas del equipo por persona, mes y línea")
     horas_df, err_horas = load_analytic_hours(d1, d2)
     if err_horas:
@@ -776,6 +830,52 @@ with tab_equipo:
             st.dataframe(pivot_horas, use_container_width=True)
 
     st.divider()
+    st.markdown("#### 🏗️ Top 5 proyectos por horas — vendedores de Staff / Formación / Fábrica (histórico mensual)")
+    st.caption("Por PROYECTO (project.project), no por tarea — solo horas de quienes son miembros de "
+               "los 3 equipos de venta. Para ver mes a mes en qué se les va el tiempo y cómo cambia esa "
+               "asignación (ej. si un vendedor se corre de 'Gestión comercial' hacia otra cosa).")
+
+    vendedores_df = load_sales_team_employees(team_ids_equipo)
+    if vendedores_df.empty:
+        st.info("No encontré vendedores (miembros de los equipos Staff/Formación/Fábrica en crm.team) "
+                "para cruzar con las horas registradas.")
+    else:
+        horas_proy_df, err_proy = load_hours_by_project(d1, d2, vendedores_df["employee_id"].tolist())
+        if err_proy:
+            st.warning(err_proy)
+        elif horas_proy_df.empty:
+            st.info("No hay horas por proyecto registradas para estos vendedores en el año seleccionado.")
+        else:
+            resumen_proy = (horas_proy_df.groupby("proyecto", as_index=False)["unit_amount"].sum()
+                            .sort_values("unit_amount", ascending=False))
+            total_horas_proy = resumen_proy["unit_amount"].sum()
+            resumen_proy["pct"] = resumen_proy["unit_amount"] / total_horas_proy * 100 if total_horas_proy else 0
+            top5_proyectos = resumen_proy.head(5)["proyecto"].tolist()
+
+            st.markdown("##### Todos los proyectos — horas y % del total (año seleccionado)")
+            st.dataframe(
+                resumen_proy, use_container_width=True, hide_index=True,
+                column_config={
+                    "proyecto": "Proyecto",
+                    "unit_amount": st.column_config.NumberColumn("Horas", format="%.2f"),
+                    "pct": st.column_config.NumberColumn("%", format="%.2f%%"),
+                },
+            )
+
+            top5_df = horas_proy_df[horas_proy_df["proyecto"].isin(top5_proyectos)]
+            mensual_top5 = top5_df.groupby(["mes", "proyecto"], as_index=False)["unit_amount"].sum()
+            fig = px.line(mensual_top5, x="mes", y="unit_amount", color="proyecto", markers=True,
+                         title="Top 5 proyectos — horas por mes (histórico)",
+                         labels={"unit_amount": "Horas", "mes": "Mes"})
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("##### Asignación mensual por vendedor, dentro del Top 5 de proyectos")
+            pivot_vend_proy = top5_df.pivot_table(index="vendedor", columns=["mes", "proyecto"],
+                                                   values="unit_amount", aggfunc="sum", fill_value=0)
+            with st.expander("📋 Ver detalle por vendedor, mes y proyecto"):
+                st.dataframe(pivot_vend_proy, use_container_width=True)
+
+    st.divider()
     st.markdown("#### 👥 Actividades del equipo por línea y mes (backlog actual)")
     st.caption("⚠️ Odoo elimina `mail.activity` al marcarla como hecha (queda como mensaje en el "
                "chatter, no como registro consultable por mes). Esto es una **foto del backlog "
@@ -784,8 +884,7 @@ with tab_equipo:
                "estándar, así que \"horas dedicadas a cada actividad\" no se puede sacar de aquí — "
                "necesitaría un registro dedicado (ej. timesheet por tipo de actividad).")
 
-    team_ids_all = [tid for tid in (team_id_for_linea(teams_df, l) for l in LINEA_TEAM) if tid]
-    actividades, err_act = load_team_activities(team_ids_all)
+    actividades, err_act = load_team_activities(team_ids_equipo)
     if err_act:
         st.warning(err_act)
     elif actividades.empty:
