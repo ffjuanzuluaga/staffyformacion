@@ -196,6 +196,37 @@ def load_won(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=600, show_spinner="Cargando órdenes de venta...")
+def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    """Órdenes de venta CONFIRMADAS (sale.order, state en sale/done) — fuente de
+    'Vendido' según el responsable del proceso: el `expected_revenue` de la
+    oportunidad en crm.lead es una estimación de la iniciativa, no el valor
+    verdadero negociado; ese valor lo tiene la orden de venta. `load_won` (CRM)
+    se sigue usando solo para CONTAR cierres/cursos/proyectos ganados, no para
+    el valor en pesos."""
+    domain = [
+        ("date_order", ">=", date_from),
+        ("date_order", "<=", f"{date_to} 23:59:59"),
+        ("state", "in", ["sale", "done"]),
+    ]
+    if team_ids:
+        domain.append(("team_id", "in", team_ids))
+    df = search_read(
+        "sale.order", domain,
+        ["name", "date_order", "partner_id", "user_id", "team_id",
+         "amount_untaxed", "amount_total"],
+        order="date_order",
+    )
+    if df.empty:
+        return df
+    df["date_order"] = pd.to_datetime(df["date_order"])
+    df["mes"] = df["date_order"].dt.to_period("M").astype(str)
+    df["vendedor"] = m2o_name(df["user_id"])
+    df["equipo"] = m2o_name(df["team_id"])
+    df["cliente"] = m2o_name(df["partner_id"])
+    return df
+
+
 @st.cache_data(ttl=600, show_spinner="Cargando facturas...")
 def load_invoices(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
     domain = [
@@ -467,11 +498,13 @@ st.caption(f"Año analizado: {anio} · Línea = equipo de venta en Odoo (crm.tea
 # Helpers compartidos por las pestañas de línea (Staff / Formación / Fábrica)
 # ─────────────────────────────────────────────
 
-def kpis_linea(linea: str, team_id: int | None, won_year: pd.DataFrame, invoices_year: pd.DataFrame,
+def kpis_linea(linea: str, team_id: int | None, sales_year: pd.DataFrame, invoices_year: pd.DataFrame,
                 leads_full_year: pd.DataFrame) -> dict:
     meta_row = metas_lineas.loc[metas_lineas["linea"] == linea, "meta_anual"]
     meta_anual = float(meta_row.iloc[0]) if not meta_row.empty else 0.0
-    vendido_anual = won_year["expected_revenue"].sum() if not won_year.empty else 0.0
+    # "Vendido" = órdenes de venta CONFIRMADAS (sale.order.amount_total), no el
+    # expected_revenue de la oportunidad en CRM — ver load_sales.
+    vendido_anual = sales_year["amount_total"].sum() if not sales_year.empty else 0.0
     facturado_anual = invoices_year["amount_total_signed"].sum() if not invoices_year.empty else 0.0
     pct_cumpl = (vendido_anual / meta_anual * 100) if meta_anual else 0.0
     mes_actual_key = f"{hoy.year}-{hoy.month:02d}"
@@ -507,34 +540,38 @@ def render_linea_tab(linea: str, extra_kpi_label: str, extra_kpi_value):
     else:
         team_ids = [team_id]
 
+    sales_year = load_sales(d1, d2, team_ids)
     won_year = load_won(d1, d2, team_ids)
     invoices_year = load_invoices(d1, d2, team_ids)
     leads_full_year = load_leads_full(d1, d2, team_ids)
     costos_analytic, err_costo = load_analytic_costs(d1, d2)
 
-    k = kpis_linea(linea, team_id, won_year, invoices_year, leads_full_year)
+    k = kpis_linea(linea, team_id, sales_year, invoices_year, leads_full_year)
     c0, c1, c2, c3, c4 = st.columns(5)
     c0.metric(extra_kpi_label, extra_kpi_value)
     c1.metric("Cumplimiento meta anual", f"{k['pct_cumpl']:.1f}%")
     c2.metric(f"Vendido en {linea} (año)", fmt_money(k["vendido_anual"]))
     c3.metric("Facturación acumulada (año)", fmt_money(k["facturado_anual"]))
     c4.metric("Leads del mes", k["leads_mes"])
+    st.caption("\"Vendido\" = órdenes de venta confirmadas (sale.order), no el valor estimado de "
+              "la oportunidad en CRM — así lo pidió el responsable del proceso: el valor "
+              "verdadero de la venta lo tiene la orden, no la iniciativa/oportunidad.")
 
     st.markdown("#### 💰 Cierre de venta mes a mes vs. meta")
     meta_row = metas_lineas.loc[metas_lineas["linea"] == linea, "meta_anual"]
     meta_mensual = (float(meta_row.iloc[0]) / 12) if not meta_row.empty else 0.0
     months_year = [f"{anio}-{m:02d}" for m in range(1, 13)]
-    ventas_mes = (won_year.groupby("mes", as_index=False)["expected_revenue"].sum()
-                 if not won_year.empty else pd.DataFrame(columns=["mes", "expected_revenue"]))
+    ventas_mes = (sales_year.groupby("mes", as_index=False)["amount_total"].sum()
+                 if not sales_year.empty else pd.DataFrame(columns=["mes", "amount_total"]))
     base_meses = pd.DataFrame({"mes": months_year})
     ventas_vs_meta = base_meses.merge(ventas_mes, on="mes", how="left")
-    ventas_vs_meta["expected_revenue"] = ventas_vs_meta["expected_revenue"].fillna(0)
+    ventas_vs_meta["amount_total"] = ventas_vs_meta["amount_total"].fillna(0)
     ventas_vs_meta["meta_mensual"] = meta_mensual
-    largo = ventas_vs_meta.melt(id_vars="mes", value_vars=["meta_mensual", "expected_revenue"],
+    largo = ventas_vs_meta.melt(id_vars="mes", value_vars=["meta_mensual", "amount_total"],
                                  var_name="concepto", value_name="valor")
-    largo["concepto"] = largo["concepto"].map({"meta_mensual": "Meta mensual", "expected_revenue": "Vendido"})
+    largo["concepto"] = largo["concepto"].map({"meta_mensual": "Meta mensual", "amount_total": "Vendido"})
     fig = px.bar(largo, x="mes", y="valor", color="concepto", barmode="group",
-                 title=f"{linea} — vendido vs. meta mensual ({anio})",
+                 title=f"{linea} — vendido (OV) vs. meta mensual ({anio})",
                  color_discrete_map={"Meta mensual": "#9ca3af", "Vendido": "#1f77b4"},
                  labels={"valor": "COP", "mes": "Mes"})
     st.plotly_chart(fig, use_container_width=True)
@@ -592,7 +629,21 @@ def render_linea_tab(linea: str, extra_kpi_label: str, extra_kpi_value):
             },
         )
 
-    with st.expander("📋 Detalle de oportunidades ganadas del año"):
+    with st.expander("📋 Detalle de órdenes de venta del año (fuente de \"Vendido\")"):
+        if sales_year.empty:
+            st.caption("Sin órdenes de venta confirmadas en el período.")
+        else:
+            st.dataframe(
+                sales_year[["name", "date_order", "vendedor", "cliente", "amount_untaxed", "amount_total"]],
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "name": "Orden", "date_order": "Fecha", "vendedor": "Vendedor", "cliente": "Cliente",
+                    "amount_untaxed": st.column_config.NumberColumn("Sin impuestos", format="$%,.0f"),
+                    "amount_total": st.column_config.NumberColumn("Total", format="$%,.0f"),
+                },
+            )
+
+    with st.expander("📋 Detalle de oportunidades ganadas del año (CRM, solo informativo)"):
         if won_year.empty:
             st.caption("Sin oportunidades ganadas en el período.")
         else:
@@ -611,16 +662,15 @@ tab_resumen, tab_staff, tab_formacion, tab_fabrica, tab_equipo, tab_vendedor = s
 with tab_resumen:
     st.caption("Comparativo de las 3 líneas. Usa el año seleccionado en la barra lateral.")
 
-    won_all_lineas = []
+    sales_all_lineas = []
     fact_all_lineas = []
     leads_all_lineas = []
     for linea in LINEA_TEAM:
         tid = team_id_for_linea(teams_df, linea)
         ids = [tid] if tid else []
-        w = load_won(d1, d2, ids)
-        if not w.empty:
-            w = w.assign(linea=linea)
-            won_all_lineas.append(w)
+        s = load_sales(d1, d2, ids)
+        if not s.empty:
+            sales_all_lineas.append(s.assign(linea=linea))
         f = load_invoices(d1, d2, ids)
         if not f.empty:
             f = f.assign(linea=linea)
@@ -630,16 +680,19 @@ with tab_resumen:
             l = l.assign(linea=linea)
             leads_all_lineas.append(l)
 
-    won_all = pd.concat(won_all_lineas, ignore_index=True) if won_all_lineas else pd.DataFrame(columns=["mes", "linea", "expected_revenue"])
+    sales_all = pd.concat(sales_all_lineas, ignore_index=True) if sales_all_lineas else pd.DataFrame(columns=["mes", "linea", "amount_total"])
     fact_all = pd.concat(fact_all_lineas, ignore_index=True) if fact_all_lineas else pd.DataFrame(columns=["mes", "linea", "amount_total_signed"])
     leads_all = pd.concat(leads_all_lineas, ignore_index=True) if leads_all_lineas else pd.DataFrame(columns=["mes", "linea", "name"])
 
     st.markdown("#### 🎯 Cumplimiento de meta anual por línea")
+    st.caption("\"Vendido\" = órdenes de venta confirmadas (sale.order), no el expected_revenue "
+              "de la oportunidad en CRM — el valor verdadero de la venta lo tiene la orden, no "
+              "la iniciativa/oportunidad (confirmado con el responsable del proceso).")
     resumen_rows = []
     for linea in LINEA_TEAM:
         meta_row = metas_lineas.loc[metas_lineas["linea"] == linea, "meta_anual"]
         meta_anual = float(meta_row.iloc[0]) if not meta_row.empty else 0.0
-        vendido = won_all.loc[won_all["linea"] == linea, "expected_revenue"].sum() if not won_all.empty else 0.0
+        vendido = sales_all.loc[sales_all["linea"] == linea, "amount_total"].sum() if not sales_all.empty else 0.0
         facturado = fact_all.loc[fact_all["linea"] == linea, "amount_total_signed"].sum() if not fact_all.empty else 0.0
         resumen_rows.append({
             "linea": linea, "meta_anual": meta_anual, "vendido": vendido, "facturado": facturado,
@@ -665,10 +718,11 @@ with tab_resumen:
                          title="Facturación mes a mes por línea", labels={"amount_total_signed": "COP", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
     with col2:
-        if not won_all.empty:
-            mensual_v = won_all.groupby(["mes", "linea"], as_index=False)["expected_revenue"].sum()
-            fig = px.bar(mensual_v, x="mes", y="expected_revenue", color="linea", barmode="group",
-                         title="Ventas ganadas mes a mes por línea", labels={"expected_revenue": "COP", "mes": "Mes"})
+        if not sales_all.empty:
+            mensual_v = sales_all.groupby(["mes", "linea"], as_index=False)["amount_total"].sum()
+            fig = px.bar(mensual_v, x="mes", y="amount_total", color="linea", barmode="group",
+                         title="Vendido (órdenes de venta) mes a mes por línea",
+                         labels={"amount_total": "COP", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
     if not leads_all.empty:
