@@ -24,6 +24,15 @@ LINEA_TEAM = {
     "Fábrica de Software": "FABRICA SOFTWARE",
 }
 
+# IDs de esta instancia (Staffing IT=11, FORMACION=6, FABRICA SOFTWARE=4).
+# Sirven cuando crm.team no es visible para el usuario API pero las OV sí traen team_id.
+KNOWN_TEAMS = {
+    "Staff": {"id": 11, "name": "Staffing IT"},
+    "Formación": {"id": 6, "name": "FORMACION"},
+    "Fábrica de Software": {"id": 4, "name": "FABRICA SOFTWARE"},
+}
+TEAM_ID_HINTS = {v["id"]: k for k, v in KNOWN_TEAMS.items()}
+
 LINEA_ANALYTIC = {
     "Staff": "Staffing IT",
     "Formación": "Formación TI",
@@ -64,6 +73,12 @@ def norm_name(value) -> str:
 def linea_from_team_name(nombre: str) -> str | None:
     if not nombre or nombre == "Sin asignar":
         return None
+    # name_get a veces falla y deja False/None como "nombre"
+    if nombre is False or nombre is None:
+        return None
+    nombre = str(nombre).strip()
+    if not nombre or nombre.lower() in ("false", "none", "sin asignar"):
+        return None
     exact = TEAM_TO_LINEA.get(nombre)
     if exact:
         return exact
@@ -71,7 +86,19 @@ def linea_from_team_name(nombre: str) -> str | None:
     for team_name, linea in TEAM_TO_LINEA.items():
         if norm_name(team_name) == n:
             return linea
-    return TEAM_ALIASES_NORM.get(n)
+    alias = TEAM_ALIASES_NORM.get(n)
+    if alias:
+        return alias
+    # Último recurso: si el nombre contiene FABRICA / FORMACION / STAFFING
+    if "fabrica" in n and "software" in n:
+        return "Fábrica de Software"
+    if n.startswith("fabrica"):
+        return "Fábrica de Software"
+    if "formacion" in n:
+        return "Formación"
+    if "staffing" in n or n == "staff":
+        return "Staff"
+    return None
 
 STAFF_ACTIVE_STATES = ("confirmed",)
 STAFF_COVERAGE_STATES = ("confirmed", "done")
@@ -139,13 +166,27 @@ def pick_fields(model: str, wanted: list[str]) -> list[str]:
 
 
 def m2o_name(series: pd.Series) -> pd.Series:
-    return series.apply(
-        lambda v: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 else "Sin asignar"
-    )
+    def _name(v):
+        if isinstance(v, (list, tuple)) and len(v) >= 2:
+            name = v[1]
+            if name is False or name is None or str(name).strip() == "":
+                return "Sin asignar"
+            return str(name)
+        return "Sin asignar"
+    return series.apply(_name)
 
 
 def m2o_id(series: pd.Series) -> pd.Series:
-    return series.apply(lambda v: v[0] if isinstance(v, (list, tuple)) else None)
+    def _id(v):
+        if isinstance(v, (list, tuple)) and v:
+            try:
+                return int(v[0])
+            except (TypeError, ValueError):
+                return None
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+        return None
+    return series.apply(_id)
 
 
 def m2o_set(series: pd.Series) -> pd.Series:
@@ -156,10 +197,26 @@ def m2o_set(series: pd.Series) -> pd.Series:
     )
 
 
-def classify_linea(df: pd.DataFrame) -> pd.Series:
+def _team_id_linea_lookup(extra: dict | None = None) -> dict:
+    mapping = dict(TEAM_ID_HINTS)
+    try:
+        mapping.update(team_id_to_linea_map())
+    except Exception:
+        pass
+    if extra:
+        mapping.update({int(k): v for k, v in extra.items()})
+    return mapping
+
+
+def classify_linea(df: pd.DataFrame, team_id_to_linea: dict | None = None) -> pd.Series:
     out = pd.Series(pd.NA, index=df.index, dtype="object")
     if "equipo" in df.columns:
         out = df["equipo"].apply(linea_from_team_name)
+    mapping = _team_id_linea_lookup(team_id_to_linea)
+    if mapping and "team_id" in df.columns:
+        ids = m2o_id(df["team_id"])
+        by_id = ids.map(lambda i: mapping.get(int(i)) if pd.notna(i) and i is not None else None)
+        out = out.where(out.notna(), by_id)
     if "service_line" in df.columns:
         fill = df["service_line"].map(SERVICE_TO_LINEA)
         out = out.where(out.notna(), fill)
@@ -204,68 +261,116 @@ def load_teams() -> pd.DataFrame:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def discover_teams_from_orders() -> dict:
-    """Descubre equipos desde sale.order.team_id (id + nombre).
+    """Descubre equipos con read_group (todos los team_id usados en OV).
 
-    Evita depender de leer crm.team: el usuario API a veces NO puede
-    search/read el equipo FABRICA SOFTWARE por reglas de CRM, pero sí lee
-    las OV y el many2one trae [id, 'FABRICA SOFTWARE'].
+    Evita el límite de search_read(5000) que se quedaba en OV antiguas y
+    nunca llegaba a FABRICA SOFTWARE (id=4 en la instancia Firefly).
     """
+    resolved = {}
+    groups = []
     try:
-        df = search_read(
+        groups = odoo_call(
             "sale.order",
-            [("team_id", "!=", False), ("state", "in", ["sale", "done", "draft", "sent"])],
-            ["team_id"],
-            limit=5000,
+            "read_group",
+            [[("team_id", "!=", False)]],
+            {"fields": ["team_id"], "groupby": ["team_id"], "lazy": False},
         )
     except Exception:
-        return {}
-    if df.empty or "team_id" not in df.columns:
-        return {}
-    resolved = {}
-    seen = set()
-    for raw in df["team_id"]:
+        groups = []
+
+    for g in groups or []:
+        raw = g.get("team_id")
         if not isinstance(raw, (list, tuple)) or len(raw) < 2:
             continue
-        tid, tname = int(raw[0]), str(raw[1])
-        if tid in seen:
-            continue
-        seen.add(tid)
+        tid, tname = int(raw[0]), str(raw[1] if raw[1] else "")
         linea = linea_from_team_name(tname)
+        if not linea and tid:
+            # name_get vacío: intentar leer crm.team por id
+            try:
+                tdf = search_read(
+                    "crm.team", [("id", "=", tid)], ["id", "name"],
+                    limit=1, context={"active_test": False},
+                )
+                if not tdf.empty:
+                    tname = str(tdf.iloc[0]["name"])
+                    linea = linea_from_team_name(tname)
+            except Exception:
+                pass
         if linea and linea not in resolved:
-            resolved[linea] = {"id": tid, "name": tname, "active": True, "via": "sale.order"}
+            resolved[linea] = {
+                "id": tid,
+                "name": tname or f"team_id={tid}",
+                "active": True,
+                "via": "sale.order.read_group",
+            }
+
+    # Pista conocida de la instancia (URL /odoo/sales-teams/4 = FABRICA SOFTWARE)
+    if "Fábrica de Software" not in resolved:
+        try:
+            tdf = search_read(
+                "crm.team",
+                ["|", ("id", "=", 4), ("name", "ilike", "FABRICA")],
+                ["id", "name", "active"],
+                limit=20,
+                context={"active_test": False},
+            )
+            for _, row in tdf.iterrows():
+                linea = linea_from_team_name(row["name"]) or (
+                    "Fábrica de Software" if int(row["id"]) == 4 else None
+                )
+                if linea == "Fábrica de Software":
+                    resolved[linea] = {
+                        "id": int(row["id"]),
+                        "name": str(row["name"]),
+                        "active": bool(row.get("active", True)),
+                        "via": "crm.team.id/hint",
+                    }
+                    break
+        except Exception:
+            pass
     return resolved
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def resolve_linea_teams() -> dict:
-    """Resuelve id/nombre de cada equipo. Primero crm.team; si falla (reglas
-    de acceso), descubre el equipo desde las OV."""
+    """Resuelve id/nombre de cada equipo. Primero crm.team; si falla,
+    descubre desde read_group de OV (+ hint id=4 para Fábrica)."""
     resolved = {}
     ctx = {"active_test": False}
+
+    # 1) Listar TODOS los equipos visibles y mapear por nombre normalizado
+    try:
+        all_teams = search_read(
+            "crm.team", [], ["id", "name", "active"],
+            order="name", context=ctx,
+        )
+    except Exception:
+        all_teams = pd.DataFrame()
+    if not all_teams.empty:
+        for _, row in all_teams.iterrows():
+            linea = linea_from_team_name(row["name"])
+            if linea and linea not in resolved:
+                resolved[linea] = {
+                    "id": int(row["id"]),
+                    "name": str(row["name"]),
+                    "active": bool(row.get("active", True)),
+                    "via": "crm.team",
+                }
+
+    # 2) Búsqueda explícita por cada nombre canónico
     for linea, nombre in LINEA_TEAM.items():
-        df = pd.DataFrame()
+        if linea in resolved:
+            continue
         try:
             df = search_read(
                 "crm.team",
-                [("name", "=ilike", nombre)],
+                ["|", ("name", "=ilike", nombre), ("name", "ilike", nombre.split()[0])],
                 ["id", "name", "active"],
-                limit=5,
+                limit=20,
                 context=ctx,
             )
         except Exception:
             df = pd.DataFrame()
-        if df.empty:
-            try:
-                # También por fragmento "FABRICA" / "SOFTWARE"
-                df = search_read(
-                    "crm.team",
-                    [("name", "ilike", nombre.split()[0])],
-                    ["id", "name", "active"],
-                    limit=20,
-                    context=ctx,
-                )
-            except Exception:
-                df = pd.DataFrame()
         if not df.empty:
             target = norm_name(nombre)
             best = None
@@ -273,20 +378,38 @@ def resolve_linea_teams() -> dict:
                 if norm_name(row["name"]) == target or linea_from_team_name(row["name"]) == linea:
                     best = row
                     break
+            if best is None and linea == "Fábrica de Software":
+                # Cualquier resultado con FABRICA en el nombre
+                for _, row in df.iterrows():
+                    if "fabrica" in norm_name(row["name"]):
+                        best = row
+                        break
             if best is not None:
                 resolved[linea] = {
                     "id": int(best["id"]),
                     "name": str(best["name"]),
                     "active": bool(best.get("active", True)),
-                    "via": "crm.team",
+                    "via": "crm.team.search",
                 }
 
-    # Completar lo que falte (típico: FABRICA SOFTWARE oculto por reglas CRM)
+    # 3) Completar desde OV (read_group) + hint id=4
     from_orders = discover_teams_from_orders()
     for linea, info in from_orders.items():
         if linea not in resolved:
             resolved[linea] = info
+
+    # 4) IDs fijos de Firefly si el usuario API no puede leer crm.team
+    for linea, hint in KNOWN_TEAMS.items():
+        if linea not in resolved:
+            resolved[linea] = {**hint, "active": True, "via": "id conocido"}
     return resolved
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def team_id_to_linea_map() -> dict:
+    """Mapa {team_id:int → línea} para clasificar OV aunque name_get falle."""
+    resolved = resolve_linea_teams()
+    return {int(v["id"]): k for k, v in resolved.items()}
 
 
 def team_id_for_linea(teams_df: pd.DataFrame, linea: str) -> int | None:
@@ -568,6 +691,7 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     df["mes"] = df["date_order"].dt.to_period("M").astype(str)
     df["vendedor"] = m2o_name(df["user_id"]) if "user_id" in df else "Sin asignar"
     df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
+    df["equipo_id"] = m2o_id(df["team_id"]) if "team_id" in df else None
     df["cliente"] = m2o_name(df["partner_id"]) if "partner_id" in df else "Sin asignar"
     df["moneda"] = m2o_name(df["currency_id"]) if "currency_id" in df else "COP"
     df["linea"] = classify_linea(df)

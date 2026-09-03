@@ -170,21 +170,27 @@ else:
         )
 
     # Diagnóstico: conteo por nombre crudo de equipo (antes de clasificar línea)
+    group_cols = [c for c in ("equipo", "equipo_id", "linea") if c in sales_all.columns]
     por_equipo = (
-        sales_all.groupby("equipo", as_index=False)
+        sales_all.groupby(group_cols, as_index=False, dropna=False)
         .agg(ov=("name", "count"), vendido=(sales_amount_col(sales_all), "sum"))
-        if "equipo" in sales_all.columns else pd.DataFrame()
+        if group_cols else pd.DataFrame()
     )
     with st.sidebar.expander("OV cargadas por equipo (debug)"):
         if por_equipo.empty:
             st.caption("Sin desglose.")
         else:
             st.dataframe(por_equipo, use_container_width=True, hide_index=True)
-            fabs = por_equipo[por_equipo["equipo"].astype(str).str.contains("FABRICA", case=False, na=False)]
+            mask = por_equipo["equipo"].astype(str).str.contains("FABRICA", case=False, na=False)
+            if "linea" in por_equipo.columns:
+                mask = mask | (por_equipo["linea"] == "Fábrica de Software")
+            if "equipo_id" in por_equipo.columns:
+                mask = mask | (pd.to_numeric(por_equipo["equipo_id"], errors="coerce") == 4)
+            fabs = por_equipo[mask]
             if fabs.empty:
-                st.error("Ninguna OV con equipo que contenga 'FABRICA'. Revisar nombre real en la tabla.")
+                st.error("Ninguna OV de Fábrica (nombre FABRICA, línea o team_id=4).")
             else:
-                st.success(f"Fábrica detectada: {fabs['ov'].sum()} OV.")
+                st.success(f"Fábrica detectada: {int(fabs['ov'].sum())} OV.")
 
 if not sales_all.empty and "fx_sin_trm" in sales_all.columns:
     fx_bad = sales_all[sales_all["fx_sin_trm"]]
