@@ -12,6 +12,7 @@ Así se rescatan ventas/facturas aunque Paula aún no haya asignado el equipo.
 from __future__ import annotations
 
 import threading
+import unicodedata
 import xmlrpc.client
 
 import pandas as pd
@@ -36,6 +37,41 @@ SERVICE_TO_LINEA = {
     "training": "Formación",
     "software_factory": "Fábrica de Software",
 }
+
+# Match flexible de nombres de equipo (sin tildes/espacios/mayúsculas).
+TEAM_ALIASES_NORM = {
+    "staffingit": "Staff",
+    "staffing": "Staff",
+    "staff": "Staff",
+    "formacion": "Formación",
+    "formacionti": "Formación",
+    "fabricasoftware": "Fábrica de Software",
+    "fabrica": "Fábrica de Software",
+    "fabricasw": "Fábrica de Software",
+}
+
+
+def norm_name(value) -> str:
+    """Normaliza para comparar nombres de equipo/cuenta: minúsculas, sin tildes ni espacios."""
+    s = str(value or "").strip().lower()
+    s = "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
+    return "".join(ch for ch in s if ch.isalnum())
+
+
+def linea_from_team_name(nombre: str) -> str | None:
+    if not nombre or nombre == "Sin asignar":
+        return None
+    exact = TEAM_TO_LINEA.get(nombre)
+    if exact:
+        return exact
+    n = norm_name(nombre)
+    for team_name, linea in TEAM_TO_LINEA.items():
+        if norm_name(team_name) == n:
+            return linea
+    return TEAM_ALIASES_NORM.get(n)
 
 STAFF_ACTIVE_STATES = ("confirmed",)
 STAFF_COVERAGE_STATES = ("confirmed", "done")
@@ -120,7 +156,7 @@ def m2o_set(series: pd.Series) -> pd.Series:
 def classify_linea(df: pd.DataFrame) -> pd.Series:
     out = pd.Series(pd.NA, index=df.index, dtype="object")
     if "equipo" in df.columns:
-        out = df["equipo"].map(TEAM_TO_LINEA)
+        out = df["equipo"].map(linea_from_team_name)
     if "service_line" in df.columns:
         fill = df["service_line"].map(SERVICE_TO_LINEA)
         out = out.where(out.notna(), fill)
@@ -153,13 +189,120 @@ def load_teams() -> pd.DataFrame:
 
 
 def team_id_for_linea(teams_df: pd.DataFrame, linea: str) -> int | None:
-    nombre = LINEA_TEAM.get(linea)
-    match = teams_df.loc[teams_df["name"] == nombre, "id"]
-    return int(match.iloc[0]) if not match.empty else None
+    if teams_df is None or teams_df.empty:
+        return None
+    target = norm_name(LINEA_TEAM.get(linea, ""))
+    if not target:
+        return None
+    for _, row in teams_df.iterrows():
+        n = norm_name(row["name"])
+        if n == target or linea_from_team_name(row["name"]) == linea:
+            return int(row["id"])
+    return None
 
 
 def all_team_ids(teams_df: pd.DataFrame) -> list[int]:
     return [tid for tid in (team_id_for_linea(teams_df, l) for l in LINEA_TEAM) if tid]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def company_currency_id() -> int | None:
+    """Moneda de la compañía actual (COP en Firefly)."""
+    try:
+        companies = search_read("res.company", [], ["currency_id"], limit=1)
+        if companies.empty:
+            return None
+        return int(m2o_id(companies["currency_id"]).iloc[0] or 0) or None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def lookup_fx_rate(currency_id: int, date_str: str, company_id: int | None) -> float | None:
+    """Busca TRM en res.currency.rate. Devuelve rate compañía→moneda (igual que sale.order.currency_rate)."""
+    if not currency_id or not date_str:
+        return None
+    domain = [
+        ("currency_id", "=", currency_id),
+        ("name", "<=", date_str[:10]),
+    ]
+    if company_id:
+        domain = domain + ["|", ("company_id", "=", False), ("company_id", "=", company_id)]
+    try:
+        rates = search_read(
+            "res.currency.rate", domain,
+            pick_fields("res.currency.rate", ["name", "rate", "company_rate", "inverse_company_rate"]),
+            order="name desc", limit=1,
+        )
+    except Exception:
+        return None
+    if rates.empty:
+        return None
+    row = rates.iloc[0]
+    # Preferir company_rate (moneda extranjera por 1 unidad de moneda compañía),
+    # que es la misma convención que sale.order.currency_rate.
+    for col in ("company_rate", "rate"):
+        if col in row and pd.notna(row[col]) and float(row[col]) not in (0.0, 1.0):
+            return float(row[col])
+    if "inverse_company_rate" in row and pd.notna(row["inverse_company_rate"]):
+        inv = float(row["inverse_company_rate"])
+        if inv not in (0.0, 1.0):
+            return 1.0 / inv
+    return None
+
+
+def amount_untaxed_company_series(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """Convierte amount_untaxed a moneda compañía: amount / currency_rate.
+
+    Si la OV está en USD y currency_rate es 1 (sin TRM), intenta res.currency.rate.
+    Devuelve (montos_cop, alerta_por_fila) donde alerta=True = no se pudo convertir.
+    """
+    if df.empty or "amount_untaxed" not in df.columns:
+        return pd.Series(dtype=float), pd.Series(dtype=bool)
+
+    company_cur = company_currency_id()
+    amounts = []
+    alerts = []
+    for _, row in df.iterrows():
+        untaxed = float(row.get("amount_untaxed") or 0.0)
+        cur_id = None
+        if "currency_id" in df.columns:
+            raw = row.get("currency_id")
+            cur_id = raw[0] if isinstance(raw, (list, tuple)) else raw
+            if cur_id is False:
+                cur_id = None
+        rate = float(row.get("currency_rate") or 0.0) if "currency_rate" in df.columns else 0.0
+        same_currency = (not cur_id) or (company_cur and int(cur_id) == int(company_cur))
+
+        if same_currency or untaxed == 0.0:
+            amounts.append(untaxed)
+            alerts.append(False)
+            continue
+
+        # rate≈1 con moneda extranjera ⇒ Odoo no tenía TRM al confirmar
+        needs_lookup = (not rate) or abs(rate - 1.0) < 1e-12
+        if needs_lookup:
+            date_str = str(row.get("date_order") or "")[:10]
+            company_id = None
+            if "company_id" in df.columns:
+                raw_c = row.get("company_id")
+                company_id = raw_c[0] if isinstance(raw_c, (list, tuple)) else raw_c
+                if company_id is False:
+                    company_id = None
+            fetched = lookup_fx_rate(int(cur_id), date_str, int(company_id) if company_id else None)
+            if fetched:
+                rate = fetched
+                needs_lookup = False
+
+        if rate and not needs_lookup:
+            amounts.append(untaxed / rate)
+            alerts.append(False)
+        else:
+            # Sin TRM: dejamos el número original y marcamos alerta (USD 1100 ≠ COP)
+            amounts.append(untaxed)
+            alerts.append(True)
+
+    return pd.Series(amounts, index=df.index), pd.Series(alerts, index=df.index)
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando metas por línea...")
@@ -286,16 +429,44 @@ def load_open_pipeline(team_ids: list[int]) -> pd.DataFrame:
 
 @st.cache_data(ttl=600, show_spinner="Cargando órdenes de venta...")
 def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    """OV confirmadas. Montos en moneda de la compañía (COP).
+
+    No filtramos solo por team_ids resueltos: también traemos por nombre de equipo
+    (ilike) y service_line, para que Fábrica no quede en cero si el match exacto falla.
+    """
     have = available_fields("sale.order")
-    domain = [
+    base = [
         ("date_order", ">=", date_from),
         ("date_order", "<=", f"{date_to} 23:59:59"),
         ("state", "in", ["sale", "done"]),
-    ] + _linea_or_domain(team_ids, have)
+    ]
+    # Ampliar OR: ids resueltos + nombres canónicos + service_line + staff
+    name_ors: list = []
+    for team_name in LINEA_TEAM.values():
+        name_ors.append(("team_id.name", "ilike", team_name))
+    # aliases cortos por si el nombre en Odoo varía
+    for alias in ("Staffing", "FORMACION", "FABRICA", "Fábrica", "Fabrica"):
+        name_ors.append(("team_id.name", "ilike", alias))
+
+    clauses: list = []
+    if team_ids:
+        clauses.append(("team_id", "in", team_ids))
+    clauses.extend(name_ors)
+    if "service_line" in have:
+        clauses.append(("service_line", "in", list(SERVICE_TO_LINEA)))
+    if "staff_request_id" in have:
+        clauses.append(("staff_request_id", "!=", False))
+
+    if clauses:
+        domain = base + ["|"] * (len(clauses) - 1) + clauses
+    else:
+        domain = base
+
     fields = pick_fields(
         "sale.order",
         ["name", "date_order", "partner_id", "user_id", "team_id",
-         "amount_untaxed", "amount_total", "service_line", "staff_request_id",
+         "amount_untaxed", "amount_total", "currency_id", "currency_rate",
+         "company_id", "service_line", "staff_request_id",
          "invoice_ids", "opportunity_id"],
     )
     df = search_read("sale.order", domain, fields, order="date_order")
@@ -306,8 +477,13 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     df["vendedor"] = m2o_name(df["user_id"])
     df["equipo"] = m2o_name(df["team_id"])
     df["cliente"] = m2o_name(df["partner_id"])
+    df["moneda"] = m2o_name(df["currency_id"]) if "currency_id" in df else "COP"
     df["linea"] = classify_linea(df)
-    return df
+    company_amt, fx_alert = amount_untaxed_company_series(df)
+    df["amount_untaxed_company"] = company_amt
+    df["fx_sin_trm"] = fx_alert
+    # Solo las 3 líneas del tablero (excluye TRANSFORMACION DIGITAL, etc.)
+    return df[df["linea"].isin(list(LINEA_TEAM))].copy()
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando facturas...")

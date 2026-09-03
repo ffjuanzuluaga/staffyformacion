@@ -54,10 +54,10 @@ st.set_page_config(
 )
 
 
-# Todos los pesos del tablero son ANTES DE IMPUESTOS (base imponible).
-# Vendido = sale.order.amount_untaxed · Facturado = account.move.amount_untaxed_signed
-# (las notas crédito restan). No se usa amount_total / Total con IVA.
-SALES_COL = "amount_untaxed"
+# Todos los pesos del tablero son ANTES DE IMPUESTOS y en moneda compañía (COP).
+# Vendido = amount_untaxed convertido con currency_rate (TRM) → amount_untaxed_company
+# Facturado = amount_untaxed_signed (ya viene en moneda compañía; NC restan).
+SALES_COL = "amount_untaxed_company"
 FACT_COL = "amount_untaxed_signed"
 
 
@@ -115,6 +115,15 @@ if not costos_fijos.empty and (costos_fijos["costo_mensual"] == 0).all():
 missing_teams = [LINEA_TEAM[l] for l in LINEA_TEAM if team_id_for_linea(teams_df, l) is None]
 if missing_teams:
     st.sidebar.error("No encontré estos equipos en Odoo: " + ", ".join(missing_teams))
+    if not teams_df.empty:
+        st.sidebar.caption("Equipos que sí existen: " + ", ".join(teams_df["name"].astype(str).tolist()))
+else:
+    matched = {
+        l: teams_df.loc[teams_df["id"] == team_id_for_linea(teams_df, l), "name"].iloc[0]
+        for l in LINEA_TEAM
+        if team_id_for_linea(teams_df, l)
+    }
+    st.sidebar.caption("Equipos mapeados: " + ", ".join(f"{k}→{v}" for k, v in matched.items()))
 
 d1, d2 = f"{anio}-01-01", f"{anio}-12-31"
 desde_12m = (pd.Period(hoy, freq="M") - 11).to_timestamp().date().isoformat()
@@ -128,6 +137,18 @@ mes_actual_key = f"{hoy.year}-{hoy.month:02d}"
 # Carga única (compartida por todas las pestañas)
 # ─────────────────────────────────────────────
 sales_all = load_sales(d1, d2, team_ids)
+if not sales_all.empty and "fx_sin_trm" in sales_all.columns:
+    fx_bad = sales_all[sales_all["fx_sin_trm"]]
+    if not fx_bad.empty:
+        st.warning(
+            f"**{len(fx_bad)} OV en moneda extranjera sin TRM usable** "
+            f"(ej. USD con `currency_rate` = 1). "
+            f"Quedan sin convertir a COP y distorsionan el total. "
+            f"Pedidos: {', '.join(fx_bad['name'].astype(str).head(8).tolist())}"
+            + ("…" if len(fx_bad) > 8 else "")
+            + ". En Odoo: Contabilidad → Configuración → Monedas → tasas (TRM) "
+            "para la fecha del pedido, o corrige la tasa en la OV."
+        )
 won_all = load_won(d1, d2, team_ids)
 won_12m = load_won(desde_12m, hoy_iso, team_ids)
 leads_all = load_leads_full(d1, d2, team_ids)
@@ -344,15 +365,33 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     c4.metric("Leads del mes", k["leads_mes"])
     st.caption(
         f"Todos los pesos son **antes de impuestos**. "
-        f"**Vendido** = `sale.order.amount_untaxed` de OV confirmadas por **Fecha del pedido** "
-        f"(`date_order`). En Odoo: Ventas → Pedidos · Fecha del pedido = {anio} · Confirmado · "
-        f"columna Importe sin impuestos. "
-        f"**Facturado** = `amount_untaxed_signed` de facturas publicadas por **Fecha de factura** "
-        f"(Base imponible; las NC restan)."
+        f"**Vendido** = OV confirmadas por **Fecha del pedido**, importe s/imp. "
+        f"**convertido a COP** con la TRM (`currency_rate`). "
+        f"Si la OV está en USD y no hay tasa, el monto no se convierte (ver aviso arriba). "
+        f"**Facturado** = base imponible en COP (`amount_untaxed_signed`; NC restan)."
     )
     chart_venta_vs_meta(linea, k["sales"])
     chart_fact_y_leads(linea, k["invoices"], k["leads"])
     chart_leads_origen(linea, k["leads"])
+    with st.expander(f"Detalle OV {linea} (s/imp. en COP)"):
+        s = k["sales"]
+        if s is None or s.empty:
+            st.caption("Sin órdenes confirmadas.")
+        else:
+            cols = [c for c in [
+                "name", "date_order", "cliente", "vendedor", "equipo", "moneda",
+                "amount_untaxed", "currency_rate", "amount_untaxed_company", "fx_sin_trm",
+            ] if c in s.columns]
+            st.dataframe(
+                s[cols].sort_values("date_order"),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "amount_untaxed": st.column_config.NumberColumn("S/imp. moneda OV", format="%,.2f"),
+                    "currency_rate": st.column_config.NumberColumn("TRM (currency_rate)", format="%.6f"),
+                    "amount_untaxed_company": st.column_config.NumberColumn("S/imp. COP", format="$%,.0f"),
+                    "fx_sin_trm": "Sin TRM",
+                },
+            )
     return k
 
 
@@ -940,8 +979,8 @@ with st.sidebar.expander("Fuentes Odoo y pendientes"):
         """
 - **Plazas** → `firefly.staffing.request` (fallback: suscripciones)
 - **Renovaciones** → `firefly.staffing.history` (fallback: `sale.order.log`)
-- **Vendido** → OV confirmadas por `date_order`, `amount_untaxed` (s/imp.)
-- **Facturas** → publicadas por `invoice_date`, `amount_untaxed_signed` (s/imp.; NC restan)
+- **Vendido** → OV confirmadas por `date_order`, s/imp. en COP (`amount_untaxed` ÷ `currency_rate`)
+- **Facturas** → publicadas por `invoice_date`, `amount_untaxed_signed` (ya en COP; NC restan)
 - **Leads / origen** → `crm.lead` + `source_id` (equipo CRM)
 - **Cursos/proyectos entregados** → `project.project.service_line` (fecha fin = proxy)
 - **Actividades hechas** → `crm.activity.report`
