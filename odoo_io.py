@@ -111,8 +111,11 @@ def odoo_call(model: str, method: str, args: list, kwargs: dict | None = None):
         return models.execute_kw(cfg["db"], uid, cfg["api_key"], model, method, args, kwargs or {})
 
 
-def search_read(model: str, domain: list, fields: list, **kw) -> pd.DataFrame:
-    records = odoo_call(model, "search_read", [domain], {"fields": fields, **kw})
+def search_read(model: str, domain: list, fields: list, context: dict | None = None, **kw) -> pd.DataFrame:
+    kwargs = {"fields": fields, **kw}
+    if context:
+        kwargs["context"] = context
+    records = odoo_call(model, "search_read", [domain], kwargs)
     df = pd.DataFrame(records)
     if df.empty:
         return pd.DataFrame(columns=fields)
@@ -185,10 +188,73 @@ def coverage_mask(df: pd.DataFrame, start_col: str, end_col: str, mes: str) -> p
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner="Cargando equipos de venta...")
 def load_teams() -> pd.DataFrame:
-    return search_read("crm.team", [], ["id", "name"], order="name")
+    # active_test=False: incluir equipos archivados (si FABRICA está archivado,
+    # sin esto no aparece y el tablero lo deja en cero).
+    try:
+        return search_read(
+            "crm.team",
+            [],
+            ["id", "name", "active"],
+            order="name",
+            context={"active_test": False},
+        )
+    except Exception:
+        return search_read("crm.team", [], ["id", "name"], order="name")
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def resolve_linea_teams() -> dict:
+    """Resuelve id de cada equipo por nombre (=ilike) directo en Odoo.
+
+    Usa active_test=False. Si crm.team no es visible, las OV igual se traen
+    por team_id.name en load_sales.
+    """
+    resolved = {}
+    ctx = {"active_test": False}
+    for linea, nombre in LINEA_TEAM.items():
+        df = pd.DataFrame()
+        try:
+            df = search_read(
+                "crm.team",
+                [("name", "=ilike", nombre)],
+                ["id", "name", "active"],
+                limit=5,
+                context=ctx,
+            )
+        except Exception:
+            df = pd.DataFrame()
+        if df.empty:
+            try:
+                df = search_read(
+                    "crm.team",
+                    [("name", "ilike", nombre)],
+                    ["id", "name", "active"],
+                    limit=10,
+                    context=ctx,
+                )
+            except Exception:
+                df = pd.DataFrame()
+        if not df.empty:
+            target = norm_name(nombre)
+            best = None
+            for _, row in df.iterrows():
+                if norm_name(row["name"]) == target:
+                    best = row
+                    break
+            if best is None:
+                best = df.iloc[0]
+            resolved[linea] = {
+                "id": int(best["id"]),
+                "name": str(best["name"]),
+                "active": bool(best.get("active", True)),
+            }
+    return resolved
 
 
 def team_id_for_linea(teams_df: pd.DataFrame, linea: str) -> int | None:
+    resolved = resolve_linea_teams()
+    if linea in resolved:
+        return resolved[linea]["id"]
     if teams_df is None or teams_df.empty:
         return None
     target = norm_name(LINEA_TEAM.get(linea, ""))
@@ -203,6 +269,31 @@ def team_id_for_linea(teams_df: pd.DataFrame, linea: str) -> int | None:
 
 def all_team_ids(teams_df: pd.DataFrame) -> list[int]:
     return [tid for tid in (team_id_for_linea(teams_df, l) for l in LINEA_TEAM) if tid]
+
+
+def _sales_team_domain(team_ids: list[int]) -> list:
+    """Dominio OR por id de equipo Y por nombre exacto (=ilike).
+
+    El filtro por nombre garantiza traer FABRICA SOFTWARE aunque el id no
+    se haya podido resolver desde crm.team (reglas de acceso / archivado).
+    """
+    clauses: list = []
+    if team_ids:
+        clauses.append(("team_id", "in", team_ids))
+    for nombre in LINEA_TEAM.values():
+        clauses.append(("team_id.name", "=ilike", nombre))
+    # Alias corto por si el nombre en Odoo tiene un sufijo/prefijo raro
+    clauses.append(("team_id.name", "ilike", "FABRICA SOFTWARE"))
+    clauses.append(("team_id.name", "ilike", "Staffing IT"))
+    clauses.append(("team_id.name", "ilike", "FORMACION"))
+    have = available_fields("sale.order")
+    if "service_line" in have:
+        clauses.append(("service_line", "in", list(SERVICE_TO_LINEA)))
+    if "staff_request_id" in have:
+        clauses.append(("staff_request_id", "!=", False))
+    if not clauses:
+        return []
+    return ["|"] * (len(clauses) - 1) + clauses
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -434,17 +525,14 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     Dominio simple (fecha + estado + equipo/service_line/staff). La conversión
     FX es local (amount_untaxed / currency_rate), sin RPC por fila.
     """
-    have = available_fields("sale.order")
     base_domain = [
         ("date_order", ">=", date_from),
         ("date_order", "<=", f"{date_to} 23:59:59"),
         ("state", "in", ["sale", "done"]),
     ]
-    # Si hay team_ids, filtramos por equipo (y service_line/staff). Si no,
-    # traemos todas las OV confirmadas del año y clasificamos en cliente —
-    # evita tablero en cero cuando falla el match de nombres de equipo.
-    extra = _linea_or_domain(team_ids, have) if team_ids else []
-    domain = base_domain + extra
+    # Filtro por id Y por team_id.name (=ilike "FABRICA SOFTWARE", etc.)
+    # para no depender de que crm.team sea visible al usuario API.
+    domain = base_domain + _sales_team_domain(team_ids)
 
     fields = pick_fields(
         "sale.order",
@@ -456,14 +544,23 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
     try:
         df = search_read("sale.order", domain, fields, order="date_order")
     except Exception:
+        # Fallback: solo nombres de equipo (sin related fields raros)
         fields = ["name", "date_order", "partner_id", "user_id", "team_id",
-                  "amount_untaxed", "amount_total", "invoice_ids"]
-        df = search_read(
-            "sale.order",
-            base_domain + ([("team_id", "in", team_ids)] if team_ids else []),
-            fields,
-            order="date_order",
-        )
+                  "amount_untaxed", "amount_total", "currency_id", "currency_rate",
+                  "invoice_ids"]
+        name_ors = ["|", "|",
+                    ("team_id.name", "=ilike", "Staffing IT"),
+                    ("team_id.name", "=ilike", "FORMACION"),
+                    ("team_id.name", "=ilike", "FABRICA SOFTWARE")]
+        try:
+            df = search_read("sale.order", base_domain + name_ors, fields, order="date_order")
+        except Exception:
+            df = search_read(
+                "sale.order",
+                base_domain + ([("team_id", "in", team_ids)] if team_ids else []),
+                fields,
+                order="date_order",
+            )
 
     if df.empty:
         return df
@@ -499,22 +596,23 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFram
 @st.cache_data(ttl=600, show_spinner="Cargando facturas...")
 def load_invoices(date_from: str, date_to: str, team_ids: list[int],
                   extra_ids: list[int] | None = None) -> pd.DataFrame:
-    """Facturas posted. Une las del equipo + las ligadas a OV de la línea
-    (por si el team_id de la factura aún no está asignado)."""
+    """Facturas posted. Une las del equipo (id o nombre) + las ligadas a OV."""
     domain = [
         ("move_type", "in", ["out_invoice", "out_refund"]),
         ("state", "=", "posted"),
         ("invoice_date", ">=", date_from),
         ("invoice_date", "<=", date_to),
     ]
-    team_clause = [("team_id", "in", team_ids)] if team_ids else []
+    team_clauses: list = []
+    if team_ids:
+        team_clauses.append(("team_id", "in", team_ids))
+    for nombre in LINEA_TEAM.values():
+        team_clauses.append(("team_id.name", "=ilike", nombre))
+    team_clauses.append(("team_id.name", "ilike", "FABRICA SOFTWARE"))
     extra_clause = [("id", "in", extra_ids)] if extra_ids else []
-    if team_clause and extra_clause:
-        domain = domain + ["|"] + team_clause + extra_clause
-    elif team_clause:
-        domain = domain + team_clause
-    elif extra_clause:
-        domain = domain + extra_clause
+    all_or = team_clauses + extra_clause
+    if all_or:
+        domain = domain + ["|"] * (len(all_or) - 1) + all_or
 
     fields = pick_fields(
         "account.move",

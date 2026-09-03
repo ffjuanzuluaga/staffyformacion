@@ -41,6 +41,7 @@ from odoo_io import (
     load_teams,
     load_won,
     month_list,
+    resolve_linea_teams,
     staffing_coverage,
     staffing_pnl_monthly,
     subscription_coverage,
@@ -119,18 +120,23 @@ if metas_lineas.empty or (metas_lineas["meta_anual"] == 0).all():
 if not costos_fijos.empty and (costos_fijos["costo_mensual"] == 0).all():
     st.sidebar.info("Los costos fijos de Diego/Paula están en 0. Actualiza `data/costos_fijos.csv` cuando Raquel confirme el valor.")
 
-missing_teams = [LINEA_TEAM[l] for l in LINEA_TEAM if team_id_for_linea(teams_df, l) is None]
+resolved_teams = resolve_linea_teams()
+missing_teams = [LINEA_TEAM[l] for l in LINEA_TEAM if l not in resolved_teams]
 if missing_teams:
     st.sidebar.error("No encontré estos equipos en Odoo: " + ", ".join(missing_teams))
     if not teams_df.empty:
-        st.sidebar.caption("Equipos que sí existen: " + ", ".join(teams_df["name"].astype(str).tolist()))
+        st.sidebar.caption("Equipos visibles vía API: " + ", ".join(teams_df["name"].astype(str).tolist()))
 else:
-    matched = {
-        l: teams_df.loc[teams_df["id"] == team_id_for_linea(teams_df, l), "name"].iloc[0]
-        for l in LINEA_TEAM
-        if team_id_for_linea(teams_df, l)
-    }
-    st.sidebar.caption("Equipos mapeados: " + ", ".join(f"{k}→{v}" for k, v in matched.items()))
+    st.sidebar.caption(
+        "Equipos mapeados: "
+        + ", ".join(f"{k}→{v['name']} (id={v['id']})" for k, v in resolved_teams.items())
+    )
+# Diagnóstico Fábrica: cuántas OV trae el año para ese equipo
+if "Fábrica de Software" not in resolved_teams:
+    st.sidebar.warning(
+        "Fábrica no resolvió id en crm.team. Las OV se buscan igual por "
+        "`team_id.name =ilike FABRICA SOFTWARE`."
+    )
 
 d1, d2 = f"{anio}-01-01", f"{anio}-12-31"
 desde_12m = (pd.Period(hoy, freq="M") - 11).to_timestamp().date().isoformat()
@@ -150,7 +156,25 @@ if sales_all.empty:
         f"Equipos resueltos: {team_ids or 'ninguno'}. "
         "Prueba 🔄 Refrescar datos. Si sigue vacío, el dominio de OV está fallando contra Odoo."
     )
-elif "fx_sin_trm" in sales_all.columns:
+else:
+    # Diagnóstico: conteo por nombre crudo de equipo (antes de clasificar línea)
+    por_equipo = (
+        sales_all.groupby("equipo", as_index=False)
+        .agg(ov=("name", "count"), vendido=(sales_amount_col(sales_all), "sum"))
+        if "equipo" in sales_all.columns else pd.DataFrame()
+    )
+    with st.sidebar.expander("OV cargadas por equipo (debug)"):
+        if por_equipo.empty:
+            st.caption("Sin desglose.")
+        else:
+            st.dataframe(por_equipo, use_container_width=True, hide_index=True)
+            fabs = por_equipo[por_equipo["equipo"].astype(str).str.contains("FABRICA", case=False, na=False)]
+            if fabs.empty:
+                st.error("Ninguna OV con equipo que contenga 'FABRICA'. Revisar nombre real en la tabla.")
+            else:
+                st.success(f"Fábrica detectada: {fabs['ov'].sum()} OV.")
+
+if not sales_all.empty and "fx_sin_trm" in sales_all.columns:
     fx_bad = sales_all[sales_all["fx_sin_trm"]]
     if not fx_bad.empty:
         st.warning(
