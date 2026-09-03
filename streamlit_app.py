@@ -55,12 +55,14 @@ st.set_page_config(
 )
 
 
-# Todos los pesos del tablero son ANTES DE IMPUESTOS y en moneda compañía (COP).
-# Vendido = amount_untaxed_company (fallback amount_untaxed).
-# Facturado = amount_untaxed_signed (ya viene en moneda compañía; NC restan).
+# Vendido = amount_untaxed_company (COP, OV convertidas con TRM).
+# Facturado = amount_untaxed_in_currency_signed → misma “Base imponible” del
+# listado de Odoo Contabilidad → Facturas (moneda del documento; NC restan).
+# amount_untaxed_signed queda como referencia en COP (moneda compañía).
 SALES_COL = "amount_untaxed_company"
 SALES_COL_FALLBACK = "amount_untaxed"
-FACT_COL = "amount_untaxed_signed"
+FACT_COL = "amount_untaxed_in_currency_signed"
+FACT_COL_COP = "amount_untaxed_signed"
 
 
 def fmt_money(v: float) -> str:
@@ -231,19 +233,37 @@ won_all = load_won(d1, d2, team_ids)
 won_12m = load_won(desde_12m, hoy_iso, team_ids)
 leads_all = load_leads_full(d1, d2, team_ids)
 pipeline = load_open_pipeline(team_ids)
-# Facturado = solo equipo de la factura (igual que Odoo Contabilidad → Facturas).
-# No se rescatan facturas por OV: eso inflaba Staff/Fábrica.
+# Facturado = equipo de la factura + Base imponible Odoo
+# (amount_untaxed_in_currency_signed). No se rescatan por OV.
 invoices_all = load_invoices(d1, d2, team_ids, extra_ids=None)
-if not invoices_all.empty and "equipo" in invoices_all.columns and FACT_COL in invoices_all.columns:
-    fact_por_equipo = (
-        invoices_all.groupby(
-            [c for c in ("equipo", "equipo_id", "linea") if c in invoices_all.columns],
-            as_index=False, dropna=False,
-        ).agg(facturas=("name", "count"), facturado=(FACT_COL, "sum"))
-    )
+if not invoices_all.empty and "equipo" in invoices_all.columns:
+    agg = {"facturas": ("name", "count")}
+    if FACT_COL in invoices_all.columns:
+        agg["base_imponible"] = (FACT_COL, "sum")
+    if FACT_COL_COP in invoices_all.columns:
+        agg["base_cop"] = (FACT_COL_COP, "sum")
+    group_cols = [c for c in ("equipo", "equipo_id", "linea", "moneda") if c in invoices_all.columns]
+    fact_por_equipo = invoices_all.groupby(group_cols, as_index=False, dropna=False).agg(**{
+        k: v for k, v in agg.items()
+    }) if group_cols else pd.DataFrame()
     with st.sidebar.expander("Facturas por equipo (debug)"):
-        st.dataframe(fact_por_equipo, use_container_width=True, hide_index=True)
-        st.caption("Criterio: team_id de la factura = equipo CRM (como en Odoo).")
+        if fact_por_equipo.empty:
+            st.caption("Sin facturas.")
+        else:
+            st.dataframe(fact_por_equipo, use_container_width=True, hide_index=True)
+            st.caption(
+                "Base imponible = `amount_untaxed_in_currency_signed` (moneda del documento, "
+                "igual que Odoo). base_cop = `amount_untaxed_signed` (COP compañía)."
+            )
+            if "moneda" in invoices_all.columns:
+                monedas = sorted(invoices_all["moneda"].dropna().astype(str).unique())
+                if len(monedas) > 1:
+                    st.warning(
+                        "Hay facturas en varias monedas: "
+                        + ", ".join(monedas)
+                        + ". Odoo suma Base imponible mezclando monedas del documento; "
+                        "para COP real usa la columna base_cop."
+                    )
 
 costos_analytic, err_costo = load_analytic_costs(d1, d2)
 staff_req, err_staff = load_staffing_requests()
@@ -448,8 +468,8 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
         f"**Vendido** = OV confirmadas por **Fecha del pedido**, importe s/imp. "
         f"**convertido a COP** con la TRM (`currency_rate`). "
         f"Si la OV está en USD y no hay tasa, el monto no se convierte (ver aviso arriba). "
-        f"**Facturado** = base imponible en COP por equipo de la factura "
-        f"(`amount_untaxed_signed`; NC restan). No se toma el equipo de la OV."
+        f"**Facturado** = Base imponible Odoo (`amount_untaxed_in_currency_signed`, "
+        f"moneda del documento; NC restan). Equipo = team_id de la factura."
     )
     chart_venta_vs_meta(linea, k["sales"])
     chart_fact_y_leads(linea, k["invoices"], k["leads"])
@@ -538,7 +558,8 @@ with tab_resumen:
         f"**Vendido:** Ventas → Pedidos · Fecha del pedido = {anio} · Confirmado · "
         f"Importe sin impuestos. "
         f"**Facturado:** Facturas de cliente · Fecha de factura = {anio} · Publicadas · "
-        f"**Equipo de ventas** de la factura · **Base imponible**. "
+        f"**Equipo de ventas** de la factura · **Base imponible** "
+        f"(`amount_untaxed_in_currency_signed`). "
         f"TRANSFORMACION DIGITAL no entra en este tablero."
     )
 

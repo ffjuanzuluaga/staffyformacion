@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación.
-_DATA_VERSION = 7
+_DATA_VERSION = 8
 
 
 def allowed_team_ids() -> set[int]:
@@ -823,7 +823,8 @@ def load_invoices(date_from: str, date_to: str, team_ids: list[int],
         if tid not in OTHER_TEAM_IDS and (not allowed or tid in allowed)
     })
     domain = [
-        ("move_type", "in", ["out_invoice", "out_refund"]),
+        # Misma familia que Contabilidad → Facturas de cliente
+        ("move_type", "in", ["out_invoice", "out_refund", "out_receipt"]),
         ("state", "=", "posted"),
         ("invoice_date", ">=", date_from),
         ("invoice_date", "<=", date_to),
@@ -837,7 +838,13 @@ def load_invoices(date_from: str, date_to: str, team_ids: list[int],
     fields = pick_fields(
         "account.move",
         ["name", "invoice_date", "partner_id", "invoice_user_id", "team_id",
-         "amount_total_signed", "amount_untaxed_signed", "payment_state", "move_type"],
+         "currency_id", "company_currency_id",
+         # Base imponible del listado Odoo (moneda del documento)
+         "amount_untaxed_in_currency_signed",
+         # Base imponible en moneda compañía (COP) — referencia
+         "amount_untaxed_signed",
+         "amount_total_signed", "amount_total_in_currency_signed",
+         "payment_state", "move_type"],
     )
     df = search_read("account.move", domain, fields, order="invoice_date")
     if df.empty:
@@ -846,6 +853,7 @@ def load_invoices(date_from: str, date_to: str, team_ids: list[int],
     df["mes"] = df["invoice_date"].dt.to_period("M").astype(str)
     df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
     df["equipo_id"] = m2o_id(df["team_id"]) if "team_id" in df else None
+    df["moneda"] = m2o_name(df["currency_id"]) if "currency_id" in df else "COP"
     df["vendedor"] = m2o_name(df["invoice_user_id"]) if "invoice_user_id" in df else "Sin asignar"
     df["cliente"] = m2o_name(df["partner_id"])
     # Solo por equipo de la factura (como el groupby de Odoo)
