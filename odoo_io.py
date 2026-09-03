@@ -24,12 +24,12 @@ LINEA_TEAM = {
     "Fábrica de Software": "FABRICA SOFTWARE",
 }
 
-# IDs de esta instancia (Staffing IT=11, FORMACION=6, FABRICA SOFTWARE=4).
-# Sirven cuando crm.team no es visible para el usuario API pero las OV sí traen team_id.
+# Fallback solo si crm.team no resuelve (los ids reales salen de resolve_linea_teams).
+# FABRICA SOFTWARE en Firefly es id=1 (antes existió como 4).
 KNOWN_TEAMS = {
     "Staff": {"id": 11, "name": "Staffing IT"},
     "Formación": {"id": 6, "name": "FORMACION"},
-    "Fábrica de Software": {"id": 4, "name": "FABRICA SOFTWARE"},
+    "Fábrica de Software": {"id": 1, "name": "FABRICA SOFTWARE"},
 }
 TEAM_ID_HINTS = {v["id"]: k for k, v in KNOWN_TEAMS.items()}
 
@@ -67,10 +67,20 @@ OTHER_TEAMS_NORM = {
 }
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
-# Solo estos team_id entran al tablero (Fábrica=4, Formación=6, Staff=11).
-ALLOWED_TEAM_IDS = set(TEAM_ID_HINTS.keys())
 # Bust de caché Streamlit cuando cambia la lógica de clasificación.
-_DATA_VERSION = 4
+_DATA_VERSION = 5
+
+
+def allowed_team_ids() -> set[int]:
+    """Ids de las 3 líneas según Odoo (crm.team / OV), no hardcode frágil."""
+    try:
+        resolved = resolve_linea_teams()
+        ids = {int(v["id"]) for v in resolved.values()}
+        if ids:
+            return ids
+    except Exception:
+        pass
+    return set(TEAM_ID_HINTS.keys())
 
 
 def norm_name(value) -> str:
@@ -225,29 +235,37 @@ def _team_id_linea_lookup(extra: dict | None = None) -> dict:
         pass
     if extra:
         mapping.update({int(k): v for k, v in extra.items()})
-    # Nunca mapear TRANSFORMACION DIGITAL ni ids fuera de las 3 líneas
+    allowed = allowed_team_ids()
+    other = set(OTHER_TEAM_IDS)
     return {
         int(k): v for k, v in mapping.items()
-        if int(k) in ALLOWED_TEAM_IDS and int(k) not in OTHER_TEAM_IDS
+        if int(k) not in other and (not allowed or int(k) in allowed)
     }
 
 
 def _mask_equipo_excluido(df: pd.DataFrame) -> pd.Series:
-    """True = equipo fuera del tablero (p.ej. TRANSFORMACION DIGITAL)."""
-    excl = pd.Series(False, index=df.index)
+    """True = equipo fuera del tablero (p.ej. TRANSFORMACION DIGITAL).
+
+    Nunca excluye un equipo cuyo nombre mapea a Staff/Formación/Fábrica
+    (evita tumbar FABRICA SOFTWARE si cambió de id 4→1).
+    """
+    is_tablero = pd.Series(False, index=df.index)
+    is_other_name = pd.Series(False, index=df.index)
     if "equipo" in df.columns:
-        excl = excl | df["equipo"].apply(es_equipo_otra_linea)
+        is_other_name = df["equipo"].apply(es_equipo_otra_linea)
+        is_tablero = df["equipo"].apply(linea_from_team_name).isin(list(LINEA_TEAM))
+    excl = is_other_name.copy()
     ids = None
     if "equipo_id" in df.columns:
         ids = pd.to_numeric(df["equipo_id"], errors="coerce")
     elif "team_id" in df.columns:
         ids = pd.to_numeric(m2o_id(df["team_id"]), errors="coerce")
     if ids is not None:
-        has_team = ids.notna()
+        allowed = allowed_team_ids()
         excl = excl | ids.isin(list(OTHER_TEAM_IDS))
-        # Cualquier otro team_id distinto de 4/6/11 queda fuera
-        excl = excl | (has_team & ~ids.isin(list(ALLOWED_TEAM_IDS)))
-    return excl.fillna(False)
+        if allowed:
+            excl = excl | (ids.notna() & ~ids.isin(list(allowed)) & ~is_tablero)
+    return (excl & ~is_tablero).fillna(False)
 
 
 def classify_linea(df: pd.DataFrame, team_id_to_linea: dict | None = None) -> pd.Series:
@@ -793,7 +811,7 @@ def load_invoices(date_from: str, date_to: str, team_ids: list[int],
     """Facturas posted del período. Sin filtro team_id.name (mismas reglas CRM).
 
     Clasifica en cliente. Si vienen extra_ids de OV de las 3 líneas, se unen.
-    Solo team_id ∈ {4,6,11} (u OV de esas líneas sin equipo en la factura).
+    Solo team_id de las 3 líneas resueltas (u OV de esas líneas sin equipo).
     """
     del _v
     domain = [
@@ -802,11 +820,11 @@ def load_invoices(date_from: str, date_to: str, team_ids: list[int],
         ("invoice_date", ">=", date_from),
         ("invoice_date", "<=", date_to),
     ]
-    # Solo ids de las 3 líneas — nunca TRANSFORMACION DIGITAL (5)
-    resolved = resolve_linea_teams()
+    # Ids resueltos en Odoo (p.ej. Fábrica=1) — nunca TRANSFORMACION DIGITAL
+    allowed = allowed_team_ids()
     ids = list({
-        tid for tid in (*(team_ids or []), *(v["id"] for v in resolved.values()))
-        if tid in ALLOWED_TEAM_IDS and tid not in OTHER_TEAM_IDS
+        tid for tid in (*(team_ids or []), *allowed)
+        if tid not in OTHER_TEAM_IDS and tid in allowed
     })
     ors: list = []
     if ids:
