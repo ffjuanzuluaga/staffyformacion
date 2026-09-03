@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación.
-_DATA_VERSION = 9
+_DATA_VERSION = 10
 
 
 def allowed_team_ids() -> set[int]:
@@ -817,57 +817,101 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int],
     return out
 
 
-@st.cache_data(ttl=600, show_spinner="Cargando facturas...")
+PRODUCT_LINE_TYPES = (
+    "product",
+    "rounding",
+    "non_deductible_product",
+    "non_deductible_product_total",
+)
+INCOME_ACCOUNT_TYPES = ("income", "income_other")
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando líneas de facturas...")
 def load_invoices(date_from: str, date_to: str, team_ids: list[int],
                   extra_ids: list[int] | None = None,
                   _v: int = _DATA_VERSION) -> pd.DataFrame:
-    """Facturas posted del período — mismo criterio que Odoo (Equipo de ventas).
+    """Facturado desde account.move.line (no el encabezado account.move).
 
-    Solo entran facturas cuyo team_id es una de las 3 líneas.
-    No se rescatan por OV de origen: eso inflaba Staff/Fábrica respecto a Odoo.
-    `extra_ids` se ignora (se mantiene en la firma por compatibilidad).
+    Misma fórmula que Odoo 19 en `_compute_amount`:
+    amount_untaxed_signed = −Σ balance de líneas display_type ∈ product/rounding/…
+    `balance` ya está en moneda compañía (COP) a la TRM de la factura.
+    Clasifica por team_id del asiento. `extra_ids` se ignora.
     """
-    del _v, extra_ids
-    allowed = allowed_team_ids()
-    ids = list({
-        tid for tid in (*(team_ids or []), *allowed)
-        if tid not in OTHER_TEAM_IDS and (not allowed or tid in allowed)
-    })
+    del extra_ids, team_ids, _v
+    line_fields = pick_fields(
+        "account.move.line",
+        ["move_id", "name", "invoice_date", "move_type", "parent_state",
+         "display_type", "account_type", "account_id",
+         "balance", "amount_currency", "currency_id", "partner_id"],
+    )
     domain = [
-        # Misma familia que Contabilidad → Facturas de cliente
+        ("parent_state", "=", "posted"),
         ("move_type", "in", ["out_invoice", "out_refund", "out_receipt"]),
-        ("state", "=", "posted"),
         ("invoice_date", ">=", date_from),
         ("invoice_date", "<=", date_to),
     ]
-    if ids:
-        domain.append(("team_id", "in", ids))
-    else:
-        # Sin equipos resueltos no inventamos facturas
-        return pd.DataFrame()
+    if "display_type" in (set(line_fields) | available_fields("account.move.line")):
+        domain.append(("display_type", "in", list(PRODUCT_LINE_TYPES)))
+    try:
+        df = search_read("account.move.line", domain, line_fields, order="invoice_date")
+    except Exception:
+        domain = [d for d in domain if not (isinstance(d, (list, tuple)) and d[0] == "display_type")]
+        df = search_read("account.move.line", domain, line_fields, order="invoice_date")
+        if not df.empty and "display_type" in df.columns:
+            df = df[df["display_type"].isin(PRODUCT_LINE_TYPES)].copy()
+        elif not df.empty and "account_type" in df.columns:
+            df = df[df["account_type"].isin(INCOME_ACCOUNT_TYPES)].copy()
 
-    fields = pick_fields(
-        "account.move",
-        ["name", "invoice_date", "partner_id", "invoice_user_id", "team_id",
-         "currency_id", "company_currency_id",
-         # Base imponible del listado Odoo (moneda del documento)
-         "amount_untaxed_in_currency_signed",
-         # Base imponible en moneda compañía (COP) — referencia
-         "amount_untaxed_signed",
-         "amount_total_signed", "amount_total_in_currency_signed",
-         "payment_state", "move_type"],
-    )
-    df = search_read("account.move", domain, fields, order="invoice_date")
     if df.empty:
         return df
-    df["invoice_date"] = pd.to_datetime(df["invoice_date"])
-    df["mes"] = df["invoice_date"].dt.to_period("M").astype(str)
-    df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
-    df["equipo_id"] = m2o_id(df["team_id"]) if "team_id" in df else None
-    df["moneda"] = m2o_name(df["currency_id"]) if "currency_id" in df else "COP"
-    df["vendedor"] = m2o_name(df["invoice_user_id"]) if "invoice_user_id" in df else "Sin asignar"
-    df["cliente"] = m2o_name(df["partner_id"])
-    # Solo por equipo de la factura (como el groupby de Odoo)
+
+    if "display_type" in df.columns:
+        df = df[df["display_type"].isin(PRODUCT_LINE_TYPES)].copy()
+    elif "account_type" in df.columns:
+        df = df[df["account_type"].isin(INCOME_ACCOUNT_TYPES)].copy()
+
+    if df.empty:
+        return df
+
+    df["move_db_id"] = m2o_id(df["move_id"]) if "move_id" in df.columns else None
+    move_ids = sorted({int(i) for i in df["move_db_id"].dropna().unique()}) if "move_db_id" in df.columns else []
+    moves = (
+        search_read(
+            "account.move",
+            [("id", "in", move_ids)],
+            pick_fields(
+                "account.move",
+                ["name", "team_id", "invoice_user_id", "partner_id",
+                 "currency_id", "invoice_date", "move_type"],
+            ),
+        )
+        if move_ids else pd.DataFrame()
+    )
+    if not moves.empty:
+        moves = moves.rename(columns={"id": "move_db_id", "name": "move_name"})
+        keep = [c for c in ("move_db_id", "move_name", "team_id", "invoice_user_id") if c in moves.columns]
+        df = df.merge(moves[keep], on="move_db_id", how="left")
+        df["name"] = df["move_name"] if "move_name" in df.columns else m2o_name(df["move_id"])
+        df["team_id"] = df["team_id"] if "team_id" in df.columns else None
+    else:
+        df["name"] = m2o_name(df["move_id"]) if "move_id" in df.columns else ""
+
+    date_col = "invoice_date" if "invoice_date" in df.columns else None
+    if date_col:
+        df["invoice_date"] = pd.to_datetime(df[date_col])
+        df["mes"] = df["invoice_date"].dt.to_period("M").astype(str)
+    df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df.columns else "Sin asignar"
+    df["equipo_id"] = m2o_id(df["team_id"]) if "team_id" in df.columns else None
+    df["moneda"] = m2o_name(df["currency_id"]) if "currency_id" in df.columns else "COP"
+    df["vendedor"] = m2o_name(df["invoice_user_id"]) if "invoice_user_id" in df.columns else "Sin asignar"
+    df["cliente"] = m2o_name(df["partner_id"]) if "partner_id" in df.columns else "Sin asignar"
+
+    # Igual que account.move._compute_amount: amount_untaxed_signed = −Σ balance
+    bal = pd.to_numeric(df.get("balance", 0), errors="coerce").fillna(0.0)
+    amt_cur = pd.to_numeric(df.get("amount_currency", 0), errors="coerce").fillna(0.0)
+    df["amount_untaxed_signed"] = -bal
+    df["amount_untaxed_in_currency_signed"] = -amt_cur
+
     df["linea"] = df["equipo"].apply(linea_from_team_name)
     if "equipo_id" in df.columns:
         id_map = _team_id_linea_lookup()
@@ -876,7 +920,6 @@ def load_invoices(date_from: str, date_to: str, team_ids: list[int],
         )
         df["linea"] = df["linea"].where(df["linea"].notna(), by_id)
     df["linea"] = df["linea"].fillna("Sin línea")
-    # Defensa: nada de TRANSFORMACION DIGITAL ni equipos fuera de las 3 líneas
     return gate_lineas_tablero(df)
 
 

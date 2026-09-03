@@ -243,7 +243,7 @@ if not invoices_all.empty and "equipo" in invoices_all.columns:
         agg["base_cop"] = (FACT_COL, "sum")
     if FACT_COL_DOC in invoices_all.columns:
         agg["base_doc_odoo"] = (FACT_COL_DOC, "sum")
-    group_cols = [c for c in ("equipo", "equipo_id", "linea", "moneda") if c in invoices_all.columns]
+    group_cols = [c for c in ("equipo", "equipo_id", "linea", "moneda", "display_type") if c in invoices_all.columns]
     fact_por_equipo = invoices_all.groupby(group_cols, as_index=False, dropna=False).agg(**{
         k: v for k, v in agg.items()
     }) if group_cols else pd.DataFrame()
@@ -253,12 +253,9 @@ if not invoices_all.empty and "equipo" in invoices_all.columns:
         else:
             st.dataframe(fact_por_equipo, use_container_width=True, hide_index=True)
             st.caption(
-                "KPI Facturado = **base_cop** = campo guardado `amount_untaxed_signed` "
-                "(COP compañía a la TRM de la factura). "
-                "**base_doc_odoo** = columna «Base imponible» del listado "
-                "(`amount_untaxed_in_currency_signed`, moneda del documento). "
-                "El tooltip €/USD del listado Odoo **no** es un campo guardado: "
-                "convierte para mostrar con la TRM del día."
+                "KPI = **base_cop** = −`account.move.line.balance` de líneas "
+                "`display_type=product` (COP compañía, igual que `amount_untaxed_signed`). "
+                "**base_doc_odoo** = −`amount_currency` (moneda del documento)."
             )
             if "moneda" in invoices_all.columns:
                 monedas = sorted(invoices_all["moneda"].dropna().astype(str).unique())
@@ -472,8 +469,9 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
         f"**Vendido** = OV confirmadas por **Fecha del pedido**, importe s/imp. "
         f"**convertido a COP** con la TRM (`currency_rate`). "
         f"Si la OV está en USD y no hay tasa, el monto no se convierte (ver aviso arriba). "
-        f"**Facturado** = base imponible en **COP compañía** "
-        f"(`amount_untaxed_signed`; NC restan). Equipo = team_id de la factura."
+        f"**Facturado** = líneas de asiento `display_type=product` "
+        f"(−`balance` en COP compañía, misma fórmula que Odoo). "
+        f"Equipo = team_id del asiento."
     )
     chart_venta_vs_meta(linea, k["sales"])
     chart_fact_y_leads(linea, k["invoices"], k["leads"])
@@ -561,11 +559,9 @@ with tab_resumen:
         f"Montos **antes de impuestos**. Para cuadrar en Odoo · "
         f"**Vendido:** Ventas → Pedidos · Fecha del pedido = {anio} · Confirmado · "
         f"Importe sin impuestos. "
-        f"**Facturado:** Facturas publicadas · equipo de la factura · "
-        f"**`amount_untaxed_signed`** (base s/imp. en COP compañía, TRM de la factura). "
-        f"No uses la «Base imponible» del listado si hay USD (mezcla monedas) ni el "
-        f"tooltip €/USD (TRM del día). "
-        f"TRANSFORMACION DIGITAL no entra en este tablero."
+        f"**Facturado:** `account.move.line` publicadas · tipo **product** · "
+        f"**−balance** (COP compañía, TRM de la factura). "
+        f"Equipo del asiento. TRANSFORMACION DIGITAL no entra."
     )
 
     # 2. Plazas
@@ -1090,7 +1086,7 @@ with st.sidebar.expander("Fuentes Odoo y pendientes"):
 - **Plazas** → `firefly.staffing.request` (fallback: suscripciones)
 - **Renovaciones** → `firefly.staffing.history` (fallback: `sale.order.log`)
 - **Vendido** → OV confirmadas por `date_order`, s/imp. en COP (`amount_untaxed` ÷ `currency_rate`)
-- **Facturas** → publicadas por `invoice_date`, `amount_untaxed_signed` (ya en COP; NC restan)
+- **Facturado** → `account.move.line` tipo product, −`balance` (COP compañía)
 - **Leads / origen** → `crm.lead` + `source_id` (equipo CRM)
 - **Cursos/proyectos entregados** → `project.project.service_line` (fecha fin = proxy)
 - **Actividades hechas** → `crm.activity.report`
