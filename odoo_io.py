@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación.
-_DATA_VERSION = 6
+_DATA_VERSION = 7
 
 
 def allowed_team_ids() -> set[int]:
@@ -810,31 +810,29 @@ def load_sales(date_from: str, date_to: str, team_ids: list[int],
 def load_invoices(date_from: str, date_to: str, team_ids: list[int],
                   extra_ids: list[int] | None = None,
                   _v: int = _DATA_VERSION) -> pd.DataFrame:
-    """Facturas posted del período. Sin filtro team_id.name (mismas reglas CRM).
+    """Facturas posted del período — mismo criterio que Odoo (Equipo de ventas).
 
-    Clasifica en cliente. Si vienen extra_ids de OV de las 3 líneas, se unen.
-    Solo team_id de las 3 líneas resueltas (u OV de esas líneas sin equipo).
+    Solo entran facturas cuyo team_id es una de las 3 líneas.
+    No se rescatan por OV de origen: eso inflaba Staff/Fábrica respecto a Odoo.
+    `extra_ids` se ignora (se mantiene en la firma por compatibilidad).
     """
-    del _v
+    del _v, extra_ids
+    allowed = allowed_team_ids()
+    ids = list({
+        tid for tid in (*(team_ids or []), *allowed)
+        if tid not in OTHER_TEAM_IDS and (not allowed or tid in allowed)
+    })
     domain = [
         ("move_type", "in", ["out_invoice", "out_refund"]),
         ("state", "=", "posted"),
         ("invoice_date", ">=", date_from),
         ("invoice_date", "<=", date_to),
     ]
-    # Ids resueltos en Odoo (p.ej. Fábrica=1) — nunca TRANSFORMACION DIGITAL
-    allowed = allowed_team_ids()
-    ids = list({
-        tid for tid in (*(team_ids or []), *allowed)
-        if tid not in OTHER_TEAM_IDS and tid in allowed
-    })
-    ors: list = []
     if ids:
-        ors.append(("team_id", "in", ids))
-    if extra_ids:
-        ors.append(("id", "in", extra_ids))
-    if ors:
-        domain = domain + (["|"] * (len(ors) - 1) + ors)
+        domain.append(("team_id", "in", ids))
+    else:
+        # Sin equipos resueltos no inventamos facturas
+        return pd.DataFrame()
 
     fields = pick_fields(
         "account.move",
@@ -850,7 +848,16 @@ def load_invoices(date_from: str, date_to: str, team_ids: list[int],
     df["equipo_id"] = m2o_id(df["team_id"]) if "team_id" in df else None
     df["vendedor"] = m2o_name(df["invoice_user_id"]) if "invoice_user_id" in df else "Sin asignar"
     df["cliente"] = m2o_name(df["partner_id"])
-    df["linea"] = classify_linea(df)
+    # Solo por equipo de la factura (como el groupby de Odoo)
+    df["linea"] = df["equipo"].apply(linea_from_team_name)
+    if "equipo_id" in df.columns:
+        id_map = _team_id_linea_lookup()
+        by_id = pd.to_numeric(df["equipo_id"], errors="coerce").map(
+            lambda i: id_map.get(int(i)) if pd.notna(i) else None
+        )
+        df["linea"] = df["linea"].where(df["linea"].notna(), by_id)
+    df["linea"] = df["linea"].fillna("Sin línea")
+    # Defensa: nada de TRANSFORMACION DIGITAL ni equipos fuera de las 3 líneas
     return gate_lineas_tablero(df)
 
 

@@ -20,8 +20,6 @@ from odoo_io import (
     _DATA_VERSION,
     all_team_ids,
     es_tipo_comercial,
-    gate_lineas_tablero,
-    invoice_ids_from_sales,
     load_activity_report,
     load_analytic_costs,
     load_analytic_hours,
@@ -233,25 +231,19 @@ won_all = load_won(d1, d2, team_ids)
 won_12m = load_won(desde_12m, hoy_iso, team_ids)
 leads_all = load_leads_full(d1, d2, team_ids)
 pipeline = load_open_pipeline(team_ids)
-inv_extra = invoice_ids_from_sales(sales_all)
-invoices_all = load_invoices(d1, d2, team_ids, extra_ids=inv_extra or None)
-# Reclasificar facturas sin equipo usando la OV de origen (solo las 3 líneas)
-if not invoices_all.empty and not sales_all.empty and "invoice_ids" in sales_all.columns:
-    so_linea = {}
-    for _, row in sales_all.iterrows():
-        linea_so = row.get("linea")
-        if linea_so not in LINEA_TEAM:
-            continue
-        for iid in (row.get("invoice_ids") or []):
-            so_linea[int(iid)] = linea_so
-    if so_linea and "id" in invoices_all.columns:
-        from_so = invoices_all["id"].map(so_linea)
-        invoices_all["linea"] = invoices_all["linea"].where(
-            invoices_all["linea"] != "Sin línea", from_so
-        ).fillna(invoices_all["linea"])
-        # Por si alguna factura quedó con equipo TRANSFORMACION DIGITAL
-        if "equipo_id" in invoices_all.columns or "equipo" in invoices_all.columns:
-            invoices_all = gate_lineas_tablero(invoices_all)
+# Facturado = solo equipo de la factura (igual que Odoo Contabilidad → Facturas).
+# No se rescatan facturas por OV: eso inflaba Staff/Fábrica.
+invoices_all = load_invoices(d1, d2, team_ids, extra_ids=None)
+if not invoices_all.empty and "equipo" in invoices_all.columns and FACT_COL in invoices_all.columns:
+    fact_por_equipo = (
+        invoices_all.groupby(
+            [c for c in ("equipo", "equipo_id", "linea") if c in invoices_all.columns],
+            as_index=False, dropna=False,
+        ).agg(facturas=("name", "count"), facturado=(FACT_COL, "sum"))
+    )
+    with st.sidebar.expander("Facturas por equipo (debug)"):
+        st.dataframe(fact_por_equipo, use_container_width=True, hide_index=True)
+        st.caption("Criterio: team_id de la factura = equipo CRM (como en Odoo).")
 
 costos_analytic, err_costo = load_analytic_costs(d1, d2)
 staff_req, err_staff = load_staffing_requests()
@@ -456,7 +448,8 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
         f"**Vendido** = OV confirmadas por **Fecha del pedido**, importe s/imp. "
         f"**convertido a COP** con la TRM (`currency_rate`). "
         f"Si la OV está en USD y no hay tasa, el monto no se convierte (ver aviso arriba). "
-        f"**Facturado** = base imponible en COP (`amount_untaxed_signed`; NC restan)."
+        f"**Facturado** = base imponible en COP por equipo de la factura "
+        f"(`amount_untaxed_signed`; NC restan). No se toma el equipo de la OV."
     )
     chart_venta_vs_meta(linea, k["sales"])
     chart_fact_y_leads(linea, k["invoices"], k["leads"])
@@ -545,7 +538,8 @@ with tab_resumen:
         f"**Vendido:** Ventas → Pedidos · Fecha del pedido = {anio} · Confirmado · "
         f"Importe sin impuestos. "
         f"**Facturado:** Facturas de cliente · Fecha de factura = {anio} · Publicadas · "
-        f"**Base imponible**. TRANSFORMACION DIGITAL no entra en este tablero."
+        f"**Equipo de ventas** de la factura · **Base imponible**. "
+        f"TRANSFORMACION DIGITAL no entra en este tablero."
     )
 
     # 2. Plazas
