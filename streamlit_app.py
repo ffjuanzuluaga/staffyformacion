@@ -125,11 +125,6 @@ if not costos_fijos.empty and (costos_fijos["costo_mensual"] == 0).all():
     st.sidebar.info("Los costos fijos de Diego/Paula están en 0. Actualiza `data/costos_fijos.csv` cuando Raquel confirme el valor.")
 
 missing_teams = [LINEA_TEAM[l] for l in LINEA_TEAM if l not in resolved_teams]
-if missing_teams:
-    st.sidebar.warning(
-        "Aún no se pudo mapear: " + ", ".join(missing_teams) + ". "
-        "Tras cargar OV debería aparecer vía sale.order."
-    )
 if resolved_teams:
     st.sidebar.caption(
         "Equipos mapeados: "
@@ -158,6 +153,22 @@ if sales_all.empty:
         "Prueba 🔄 Refrescar datos. Si sigue vacío, el dominio de OV está fallando contra Odoo."
     )
 else:
+    # Validación real por datos cargados: si una línea aparece en OV,
+    # no debe mostrarse como faltante aunque crm.team no sea visible.
+    lineas_en_ov = set(sales_all["linea"].dropna().astype(str).unique()) if "linea" in sales_all.columns else set()
+    still_missing = []
+    for linea, team_name in LINEA_TEAM.items():
+        if linea in lineas_en_ov:
+            continue
+        if linea in resolved_teams:
+            continue
+        still_missing.append(team_name)
+    if still_missing:
+        st.sidebar.warning(
+            "No se pudo mapear por crm.team y tampoco apareció en OV: "
+            + ", ".join(still_missing)
+        )
+
     # Diagnóstico: conteo por nombre crudo de equipo (antes de clasificar línea)
     por_equipo = (
         sales_all.groupby("equipo", as_index=False)
