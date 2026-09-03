@@ -2,8 +2,16 @@
 
 Tablero ejecutivo conectado en vivo a Odoo 19 (XML-RPC) para las líneas
 **Staff** (staffing), **Formación** y **Fábrica de Software**. Nace de la
-reunión con Raquel Cañón / Paula López (2026-08) para dejar de depender de
-Excel en estos informes.
+reunión con Raquel Cañón / Paula López para dejar de depender de Excel.
+
+La pestaña **Resumen** responde las 6 preguntas del informe:
+
+1. ¿Estamos cumpliendo las metas de ventas anuales?
+2. ¿Cuántas plazas activas hay y qué se espera a 6 meses?
+3. ¿Las líneas son rentables?
+4. ¿De dónde vienen las oportunidades?
+5. ¿Están llegando leads a cada línea?
+6. ¿El equipo dedica tiempo a cada línea y se ven resultados?
 
 ## Cómo correrlo localmente
 
@@ -18,51 +26,46 @@ $ uv run streamlit run streamlit_app.py
 ## Configuración de datos
 
 - `data/metas_lineas.csv` — meta de venta **anual** por línea (`linea,meta_anual`).
-  Los nombres de línea deben coincidir EXACTAMENTE con las claves de
-  `LINEA_TEAM` en `streamlit_app.py` (Staff / Formación / Fábrica de Software).
-- `data/costos_fijos.csv` — costo fijo mensual por línea (`linea,persona,costo_mensual`),
-  usado en el cálculo de rentabilidad (ej. costo de Diego en Staff, Paula en Formación).
+  Los nombres deben coincidir con las claves de `LINEA_TEAM` (Staff / Formación / Fábrica de Software).
+- `data/costos_fijos.csv` — costo fijo mensual (`linea,persona,costo_mensual`).
+  Diego en Staff y Paula en Formación. Hoy van en 0 hasta que Raquel confirme el valor.
 
-## Supuestos técnicos a verificar contra la Odoo real
+## Cómo se clasifica una línea
 
-Este dashboard reutiliza patrones ya probados en producción en el repo
-hermano `gdp-dashboard-1` (mismo Odoo, mismo cliente), pero hay 3 piezas
-nuevas que no estaban validadas antes y pueden necesitar un ajuste de
-nombre de campo/modelo la primera vez que corra contra Odoo real:
+En este orden, el primero que aplique:
 
-1. **Línea = equipo de venta (`crm.team`)** — según lo acordado en la
-   reunión (equipos, no etiquetas). `LINEA_TEAM` en el código asume que los
-   equipos se llaman exactamente "Staff", "Formación" y "Fábrica de
-   Software" — ajusta el diccionario si los nombres reales son otros.
-2. **Plazas activas de Staff** = # de `sale.order` con
-   `is_subscription=True` y `subscription_state='3_progress'` del equipo
-   Staff (cada suscripción = 1 plaza, tal como se decidió). Si una
-   suscripción agrupa varias plazas en una sola línea de producto, hay que
-   cambiar el conteo por `product_uom_qty`.
-3. **Horas y costos del equipo** = `account.analytic.line`, asumiendo una
-   cuenta analítica por línea con el mismo nombre que la línea
-   (`LINEA_ANALYTIC`). Si aún no existen esas cuentas analíticas, la
-   pestaña Equipo y la sección de Rentabilidad de cada línea muestran un
-   aviso en vez de romper.
+1. Equipo de venta (`crm.team`): `Staffing IT`, `FORMACION`, `FABRICA SOFTWARE`
+2. `sale.order.service_line` / `project.project.service_line` (`staff`, `training`, `software_factory`)
+3. `staff_request_id` (módulo `firefly_staffing`) → Staff
 
-Si algo de esto truena contra la Odoo real, el mensaje de error dice qué
-modelo/campo revisar.
+Así se rescatan ventas y facturas aunque el equipo CRM aún no esté asignado.
 
-## Cosas explícitamente pendientes / fuera de alcance de este dashboard
+Cuentas analíticas: `Staffing IT`, `Formación TI`, `Fábrica Software`.
 
-De las notas de la reunión, esto **no** está resuelto todavía y necesita
-trabajo aparte (probablemente un módulo/config en Odoo, no en este repo):
+## Fuentes Odoo por indicador
 
-- Automatizar la creación de cuentas analíticas al generar cada suscripción
-  (para vincular consistentemente facturas de proveedor y de cliente).
-- Campo dedicado en la suscripción/orden para identificar el recurso de
-  staffing (hoy va en texto libre en la descripción).
-- Reclasificación de leads de Staff vs. Fábrica de Software en el equipo
-  de ventas (a cargo de Paula).
-- Fuente de datos real para las **proyecciones** de cursos vendidos
-  (Formación) y proyectos vendidos (Fábrica) — el dashboard usa mientras
-  tanto un promedio móvil simple marcado como "provisional" en la UI.
-- "Horas dedicadas a cada tipo de actividad" (ej. cuántas horas le dedica
-  alguien a hacer propuestas) no se puede sacar de `mail.activity` (no
-  tiene duración y Odoo la borra al completarla) — necesitaría un registro
-  dedicado si se quiere ese detalle.
+| Indicador | Modelo / campo |
+|---|---|
+| Plazas activas y proyección | `firefly.staffing.request` (`date_start`/`date_end`, estado confirmado). Fallback: `sale.order` con `is_subscription` |
+| Renovaciones del mes | `firefly.staffing.history` (`event_type=renewal`). Fallback: `sale.order.log` transferencias |
+| Rentabilidad Staff (recurso) | Valor mensual a cobrar − valor a pagar al proveedor − fijo de Diego |
+| Vendido en pesos | `sale.order` confirmadas (`amount_total`) |
+| Facturación | `account.move` posted + facturas ligadas a esas OV |
+| Leads / origen | `crm.lead` + `source_id`, filtrado por equipo |
+| Cierre vs. meta | OV confirmadas vs. `meta_anual / 12` |
+| Cursos/proyectos vendidos | Oportunidades `won_status=won` |
+| Proyección 6 meses (Formación/Fábrica) | Pipeline abierto con `date_deadline` |
+| Cursos/proyectos entregados | `project.project.service_line` (fecha fin = proxy; falta campo de entrega) |
+| Actividades hechas | `crm.activity.report` (chatter con tipo de actividad) |
+| Horas por línea / persona | `account.analytic.line` (`unit_amount`) |
+| Horas por tipo de actividad | `calendar.event.duration` ligado a oportunidad (proxy) |
+
+## Pendientes que no se resuelven en este repo
+
+- **JUAN Z:** campo de fecha de entrega de capacitaciones. Mientras tanto se usa
+  `project.project.date` (fin) → `date_start` → `create_date`.
+- **PAULA / Raquel:** valor real del costo fijo de Diego (Staff) y Paula (Formación).
+- **PAULA:** asignar equipo de venta en OV/facturas Staff; completar `date_deadline`
+  en el pipeline; revisar orígenes/campañas y actividades de Formación y Staff.
+- `mail.activity` no guarda duración y Odoo la borra al completar. Las horas por
+  tipo de actividad son un proxy de calendario, no un timesheet por actividad.

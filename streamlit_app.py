@@ -1,471 +1,88 @@
 # -*- coding: utf-8 -*-
 """
-Dashboard de las líneas Staff (staffing), Formación y Fábrica de Software,
-conectado a Odoo 19 vía XML-RPC. Nace de la reunión con Raquel Cañón / Paula
-López del 2026-08 para dejar de depender de Excel en estos informes.
+Dashboard de las líneas Staff, Formación y Fábrica de Software.
+Conectado a Odoo 19 vía XML-RPC. Extrae CRM, ventas, facturas,
+firefly.staffing.request, suscripciones, proyectos (service_line),
+analítica y crm.activity.report.
 
-Convenciones (iguales a las de los otros tableros del repo hermano
-`gdp-dashboard-1`, que ya corre en producción contra esta misma base de
-Odoo):
-  - "línea" = crm.team (equipo de venta) — la reunión decidió usar equipos
-    en vez de etiquetas para segmentar Staff / Formación / Fábrica de SW.
-  - Costos y horas del equipo salen de contabilidad analítica
-    (account.analytic.line): se asume UNA cuenta analítica por línea, con
-    el mismo nombre que la línea (igual que ya funciona para Soporte /
-    Implementación / Licenciamiento en gdp-dashboard-1).
-  - Metas de venta: CSV en data/ (igual convención que metas.csv /
-    metas_lineas.csv de los otros tableros) — el equipo comercial las
-    actualiza sin tocar código.
-
-Supuestos a verificar contra la Odoo real (nombres de campo/modelo que uso
-por primera vez aquí, no confirmados aún en este código):
-  - "Plazas activas" de Staff = # de sale.order con subscription_state en
-    progreso ('3_progress') del equipo Staff. Si una suscripción agrupa
-    varias plazas en una sola línea, hay que sumar product_uom_qty en vez
-    de contar órdenes — avisen y lo ajusto.
-  - Horas del equipo = account.analytic.line (unit_amount, employee_id,
-    account_id, date) — es donde caen los partes de horas / timesheets en
-    Odoo 19.
-  - "Cursos vendidos" (Formación) y "proyectos vendidos" (Fábrica) se miden
-    como oportunidades GANADAS por mes de esa línea — la fuente exacta de
-    las PROYECCIONES sigue pendiente de definir con Paula (según la
-    reunión), así que la proyección a 6 meses es un promedio móvil simple,
-    marcado como provisional en la propia UI.
-  - "Horas dedicadas a cada tipo de actividad" NO se puede sacar de
-    mail.activity (no trae duración en Odoo estándar y Odoo borra la
-    actividad al completarla) — queda documentado como pendiente, igual
-    que ya está documentado ese límite en tablero_soporte_firefly.
-
-Si algo de esto truena contra la Odoo real, el error dice qué modelo/campo
-revisar — no hace falta adivinar, se ajusta con el traceback en mano.
+Las 6 preguntas del informe están contestadas en la pestaña Resumen.
 """
 
-import threading
-import xmlrpc.client
 from datetime import date, datetime
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-# ─────────────────────────────────────────────
-# Configuración de página
-# ─────────────────────────────────────────────
+from odoo_io import (
+    LINEA_ANALYTIC,
+    LINEA_TEAM,
+    all_team_ids,
+    es_tipo_comercial,
+    invoice_ids_from_sales,
+    load_activity_report,
+    load_analytic_costs,
+    load_analytic_hours,
+    load_calendar_hours,
+    load_costos_fijos,
+    load_hours_by_project,
+    load_invoices,
+    load_leads_full,
+    load_metas_lineas,
+    load_open_pipeline,
+    load_projects,
+    load_sales,
+    load_sales_team_employees,
+    load_staffing_renewals,
+    load_staffing_requests,
+    load_subscription_logs,
+    load_subscriptions,
+    load_team_activities,
+    load_teams,
+    load_won,
+    month_list,
+    staffing_coverage,
+    staffing_pnl_monthly,
+    subscription_coverage,
+    team_id_for_linea,
+)
+
 st.set_page_config(
     page_title="Dashboard Staff y Formación · Odoo 19",
     page_icon="📋",
     layout="wide",
 )
 
-# Línea de negocio → nombre del equipo de venta (crm.team) en Odoo. Un solo
-# lugar para corregir si el nombre real del equipo cambia.
-LINEA_TEAM = {
-    "Staff": "Staffing IT",
-    "Formación": "FORMACION",
-    "Fábrica de Software": "FABRICA SOFTWARE",
-}
-
-# Línea de negocio → nombre de la cuenta analítica (account.analytic.account)
-# que agrupa sus costos/horas. OJO: el nombre de la cuenta analítica NO es
-# igual al del equipo de venta (confirmado con Juan Camilo).
-LINEA_ANALYTIC = {
-    "Staff": "Staffing IT",
-    "Formación": "Formación TI",
-    "Fábrica de Software": "Fábrica Software",
-}
-# Inversa (nombre de cuenta analítica en Odoo → línea interna), para volver a
-# la clave interna después de leer account.analytic.line — que trae el
-# nombre de la cuenta, no la línea.
-ANALYTIC_TO_LINEA = {v: k for k, v in LINEA_ANALYTIC.items()}
-
 
 def fmt_money(v: float) -> str:
     return f"${v:,.0f}"
 
 
-# ─────────────────────────────────────────────
-# Conexión a Odoo (XML-RPC) — mismo patrón que los demás tableros del repo
-# ─────────────────────────────────────────────
-_odoo_lock = threading.Lock()
+def filtro_linea(df: pd.DataFrame, linea: str) -> pd.DataFrame:
+    if df is None or df.empty or "linea" not in df.columns:
+        return df if df is not None else pd.DataFrame()
+    return df[df["linea"] == linea].copy()
 
 
-@st.cache_resource(show_spinner="Conectando con Odoo...")
-def get_connection():
-    cfg = st.secrets["odoo"]
-    common = xmlrpc.client.ServerProxy(f"{cfg['url']}/xmlrpc/2/common", allow_none=True)
-    with _odoo_lock:
-        uid = common.authenticate(cfg["db"], cfg["username"], cfg["api_key"], {})
-    if not uid:
-        st.error("❌ Autenticación fallida. Verifica url, db, username y api_key en los Secrets.")
-        st.stop()
-    models = xmlrpc.client.ServerProxy(f"{cfg['url']}/xmlrpc/2/object", allow_none=True)
-    return cfg, uid, models
+def meta_anual_de(metas: pd.DataFrame, linea: str) -> float:
+    row = metas.loc[metas["linea"] == linea, "meta_anual"]
+    return float(row.iloc[0]) if not row.empty else 0.0
 
 
-def odoo_call(model: str, method: str, args: list, kwargs: dict | None = None):
-    cfg, uid, models = get_connection()
-    with _odoo_lock:
-        return models.execute_kw(cfg["db"], uid, cfg["api_key"], model, method, args, kwargs or {})
+def costo_fijo_de(costos: pd.DataFrame, linea: str) -> float:
+    return float(costos.loc[costos["linea"] == linea, "costo_mensual"].sum()) if not costos.empty else 0.0
 
 
-def search_read(model: str, domain: list, fields: list, **kw) -> pd.DataFrame:
-    records = odoo_call(model, "search_read", [domain], {"fields": fields, **kw})
-    df = pd.DataFrame(records)
-    if df.empty:
-        return pd.DataFrame(columns=fields)
-    return df
-
-
-def m2o_name(series: pd.Series) -> pd.Series:
-    return series.apply(lambda v: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 else "Sin asignar")
-
-
-def m2o_id(series: pd.Series) -> pd.Series:
-    return series.apply(lambda v: v[0] if isinstance(v, (list, tuple)) else None)
+def semaforo(pct: float) -> str:
+    if pct >= 100:
+        return "🟢"
+    if pct >= 70:
+        return "🟡"
+    return "🔴"
 
 
 # ─────────────────────────────────────────────
-# Carga de datos (cacheada 10 min)
-# ─────────────────────────────────────────────
-@st.cache_data(ttl=600, show_spinner="Cargando equipos de venta...")
-def load_teams() -> pd.DataFrame:
-    return search_read("crm.team", [], ["id", "name"], order="name")
-
-
-def team_id_for_linea(teams_df: pd.DataFrame, linea: str) -> int | None:
-    nombre = LINEA_TEAM.get(linea)
-    match = teams_df.loc[teams_df["name"] == nombre, "id"]
-    return int(match.iloc[0]) if not match.empty else None
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando leads y pipeline...")
-def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
-    """Todo el pipeline (leads + oportunidades) con origen y equipo, para
-    clasificar por línea, conteo de leads nuevos y análisis de origen."""
-    domain = [
-        ("create_date", ">=", date_from),
-        ("create_date", "<=", f"{date_to} 23:59:59"),
-        "|", ("active", "=", True), ("active", "=", False),
-    ]
-    if team_ids:
-        domain.append(("team_id", "in", team_ids))
-    df = search_read(
-        "crm.lead", domain,
-        ["name", "create_date", "date_closed", "user_id", "team_id", "source_id",
-         "expected_revenue", "probability", "active", "type", "won_status"],
-        order="create_date",
-    )
-    if df.empty:
-        return df
-    df["create_date"] = pd.to_datetime(df["create_date"])
-    df["mes"] = df["create_date"].dt.to_period("M").astype(str)
-    df["vendedor"] = m2o_name(df["user_id"])
-    df["equipo"] = m2o_name(df["team_id"])
-    df["origen"] = m2o_name(df["source_id"])
-    df["estado"] = df["won_status"].map({"won": "Ganada", "lost": "Perdida", "pending": "Abierta"})
-    return df
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas...")
-def load_won(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
-    """Oportunidades GANADAS con fecha de cierre en el período (para
-    "cierre de venta mes a mes" — sale del CRM, no de facturación).
-    GANADA = won_status == 'won' (probability 100 Y stage_id.is_won — el campo
-    real de Odoo, confirmado en odoo/addons/crm/models/crm_lead.py; más estricto
-    que solo probability == 100)."""
-    domain = [
-        ("type", "=", "opportunity"),
-        ("won_status", "=", "won"),
-        ("date_closed", ">=", date_from),
-        ("date_closed", "<=", f"{date_to} 23:59:59"),
-    ]
-    if team_ids:
-        domain.append(("team_id", "in", team_ids))
-    df = search_read(
-        "crm.lead", domain,
-        ["name", "date_closed", "user_id", "team_id", "partner_id", "expected_revenue"],
-        order="date_closed",
-    )
-    if df.empty:
-        return df
-    df["date_closed"] = pd.to_datetime(df["date_closed"])
-    df["mes"] = df["date_closed"].dt.to_period("M").astype(str)
-    df["vendedor"] = m2o_name(df["user_id"])
-    df["equipo"] = m2o_name(df["team_id"])
-    df["cliente"] = m2o_name(df["partner_id"])
-    return df
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando órdenes de venta...")
-def load_sales(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
-    """Órdenes de venta CONFIRMADAS (sale.order, state en sale/done) — fuente de
-    'Vendido' según el responsable del proceso: el `expected_revenue` de la
-    oportunidad en crm.lead es una estimación de la iniciativa, no el valor
-    verdadero negociado; ese valor lo tiene la orden de venta. `load_won` (CRM)
-    se sigue usando solo para CONTAR cierres/cursos/proyectos ganados, no para
-    el valor en pesos."""
-    domain = [
-        ("date_order", ">=", date_from),
-        ("date_order", "<=", f"{date_to} 23:59:59"),
-        ("state", "in", ["sale", "done"]),
-    ]
-    if team_ids:
-        domain.append(("team_id", "in", team_ids))
-    df = search_read(
-        "sale.order", domain,
-        ["name", "date_order", "partner_id", "user_id", "team_id",
-         "amount_untaxed", "amount_total"],
-        order="date_order",
-    )
-    if df.empty:
-        return df
-    df["date_order"] = pd.to_datetime(df["date_order"])
-    df["mes"] = df["date_order"].dt.to_period("M").astype(str)
-    df["vendedor"] = m2o_name(df["user_id"])
-    df["equipo"] = m2o_name(df["team_id"])
-    df["cliente"] = m2o_name(df["partner_id"])
-    return df
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando facturas...")
-def load_invoices(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
-    domain = [
-        ("move_type", "in", ["out_invoice", "out_refund"]),
-        ("state", "=", "posted"),
-        ("invoice_date", ">=", date_from),
-        ("invoice_date", "<=", date_to),
-    ]
-    if team_ids:
-        domain.append(("team_id", "in", team_ids))
-    df = search_read(
-        "account.move", domain,
-        ["name", "invoice_date", "partner_id", "invoice_user_id", "team_id",
-         "amount_total_signed", "payment_state", "move_type"],
-        order="invoice_date",
-    )
-    if df.empty:
-        return df
-    df["invoice_date"] = pd.to_datetime(df["invoice_date"])
-    df["mes"] = df["invoice_date"].dt.to_period("M").astype(str)
-    df["equipo"] = m2o_name(df["team_id"])
-    df["vendedor"] = m2o_name(df["invoice_user_id"])
-    df["cliente"] = m2o_name(df["partner_id"])
-    return df
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando suscripciones de Staff...")
-def load_subscriptions(team_id: int | None):
-    """Suscripciones (sale.order con subscription_state) del equipo dado —
-    fuente de "plazas activas" de Staff. Devuelve (df, error); error trae
-    el mensaje si el campo/modelo no coincide con esta instancia."""
-    cols = ["name", "partner_id", "subscription_state", "start_date", "end_date", "team_id"]
-    domain = [("is_subscription", "=", True)]
-    if team_id:
-        domain.append(("team_id", "=", team_id))
-    try:
-        df = search_read("sale.order", domain, cols)
-    except Exception as e:
-        return pd.DataFrame(columns=cols), (
-            f"No se pudo consultar suscripciones (sale.order.is_subscription/subscription_state): {e}. "
-            "Puede que en esta versión el campo se llame distinto — revisa el modelo sale.order."
-        )
-    if df.empty:
-        return df, None
-    df["cliente"] = m2o_name(df["partner_id"])
-    df["start_date"] = pd.to_datetime(df["start_date"], errors="coerce")
-    df["end_date"] = pd.to_datetime(df["end_date"], errors="coerce")
-    return df, None
-
-
-def coverage_per_month(df: pd.DataFrame, start_col: str, end_col: str, months: list[str],
-                        state_col: str | None = None, active_states: tuple = ()) -> pd.DataFrame:
-    """# de filas cuya vigencia [start,end] cubre cada mes de `months`
-    (formato 'YYYY-MM'). end nulo = sigue vigente. Mismo criterio de
-    "ventana de vigencia" que ya usa tablero_soporte_firefly para contratos
-    activos por mes."""
-    rows = []
-    for mes in months:
-        period = pd.Period(mes, freq="M")
-        month_start, month_end = period.to_timestamp(how="start"), period.to_timestamp(how="end")
-        sub = df
-        if state_col and active_states:
-            sub = df[df[state_col].isin(active_states)]
-        active = (sub[start_col] <= month_end) & (sub[end_col].isna() | (sub[end_col] >= month_start))
-        rows.append({"mes": mes, "activas": int(active.sum())})
-    return pd.DataFrame(rows)
-
-
-def naive_projection(monthly_df: pd.DataFrame, value_col: str, months_fwd: int = 6, window: int = 3) -> pd.DataFrame:
-    """Proyección simple: promedio móvil de los últimos `window` meses,
-    repetido hacia adelante. PROVISIONAL — reemplazar cuando se defina la
-    fuente real de proyecciones con Paula (pendiente según la reunión)."""
-    if monthly_df.empty:
-        return pd.DataFrame(columns=["mes", value_col])
-    ultimo_mes = pd.Period(monthly_df["mes"].max(), freq="M")
-    promedio = monthly_df.tail(window)[value_col].mean()
-    rows = []
-    for i in range(1, months_fwd + 1):
-        mes = (ultimo_mes + i)
-        rows.append({"mes": str(mes), value_col: promedio})
-    return pd.DataFrame(rows)
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando costos analíticos por línea...")
-def load_analytic_costs(date_from: str, date_to: str):
-    """Costos (importe negativo, convención estándar de Odoo) por cuenta
-    analítica de línea — igual patrón que gdp-dashboard-1 usa para
-    Soporte/Implementación/Licenciamiento."""
-    cols = ["date", "amount", "account_id"]
-    domain = [
-        ("account_id.name", "in", list(LINEA_ANALYTIC.values())),
-        ("date", ">=", date_from), ("date", "<=", date_to),
-        ("amount", "<", 0),
-    ]
-    try:
-        df = search_read("account.analytic.line", domain, cols)
-    except Exception as e:
-        return pd.DataFrame(columns=cols), (
-            f"No se pudo consultar costos analíticos (account.analytic.line): {e}. "
-            f"Verifica que exista una cuenta analítica por línea, con el mismo nombre "
-            f"que la línea ({', '.join(LINEA_ANALYTIC.values())})."
-        )
-    if df.empty:
-        return df, None
-    df["date"] = pd.to_datetime(df["date"])
-    df["mes"] = df["date"].dt.to_period("M").astype(str)
-    df["linea"] = m2o_name(df["account_id"]).map(ANALYTIC_TO_LINEA).fillna("Sin línea")
-    df["costo"] = -df["amount"]
-    return df, None
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando horas del equipo por línea...")
-def load_analytic_hours(date_from: str, date_to: str):
-    """Horas registradas (partes de horas / timesheets, unit_amount > 0)
-    por cuenta analítica de línea, empleado y mes."""
-    cols = ["date", "unit_amount", "account_id", "employee_id"]
-    domain = [
-        ("account_id.name", "in", list(LINEA_ANALYTIC.values())),
-        ("date", ">=", date_from), ("date", "<=", date_to),
-        ("unit_amount", ">", 0),
-    ]
-    try:
-        df = search_read("account.analytic.line", domain, cols)
-    except Exception as e:
-        return pd.DataFrame(columns=cols), f"No se pudo consultar horas del equipo (account.analytic.line.unit_amount/employee_id): {e}"
-    if df.empty:
-        return df, None
-    df["date"] = pd.to_datetime(df["date"])
-    df["mes"] = df["date"].dt.to_period("M").astype(str)
-    df["linea"] = m2o_name(df["account_id"]).map(ANALYTIC_TO_LINEA).fillna("Sin línea")
-    df["persona"] = m2o_name(df["employee_id"])
-    return df, None
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando vendedores de los equipos de venta...")
-def load_sales_team_employees(team_ids: list[int]) -> pd.DataFrame:
-    """Empleados (hr.employee) que son vendedores (member_ids, res.users) de
-    los equipos de venta dados — para acotar las horas por proyecto solo a
-    estas personas, no a todo el equipo de delivery/consultoría."""
-    cols = ["employee_id", "user_id", "vendedor"]
-    if not team_ids:
-        return pd.DataFrame(columns=cols)
-    teams = search_read("crm.team", [("id", "in", team_ids)], ["id", "member_ids"])
-    if teams.empty:
-        return pd.DataFrame(columns=cols)
-    user_ids = sorted({uid for ids in teams["member_ids"] for uid in (ids or [])})
-    if not user_ids:
-        return pd.DataFrame(columns=cols)
-    emp = search_read("hr.employee", [("user_id", "in", user_ids)], ["id", "user_id", "name"])
-    if emp.empty:
-        return pd.DataFrame(columns=cols)
-    emp["user_id"] = m2o_id(emp["user_id"])
-    return emp.rename(columns={"id": "employee_id", "name": "vendedor"})[cols]
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando horas por proyecto...")
-def load_hours_by_project(date_from: str, date_to: str, employee_ids: list[int]):
-    """Horas (timesheets, unit_amount > 0) por PROYECTO (project.project) —
-    no por tarea — empleado y mes. Para el "Top 5 de proyectos" que pidió
-    Raquel: monitorear en qué se va el tiempo del equipo comercial, mes a
-    mes, para ver si la carga está alineada con lo comercial/operativo."""
-    cols = ["date", "unit_amount", "project_id", "employee_id"]
-    domain = [
-        ("date", ">=", date_from), ("date", "<=", date_to),
-        ("unit_amount", ">", 0),
-        ("project_id", "!=", False),
-    ]
-    if employee_ids:
-        domain.append(("employee_id", "in", employee_ids))
-    try:
-        df = search_read("account.analytic.line", domain, cols)
-    except Exception as e:
-        return pd.DataFrame(columns=cols), f"No se pudo consultar horas por proyecto (account.analytic.line.project_id): {e}"
-    if df.empty:
-        return df, None
-    df["date"] = pd.to_datetime(df["date"])
-    df["mes"] = df["date"].dt.to_period("M").astype(str)
-    df["proyecto"] = m2o_name(df["project_id"])
-    df["vendedor"] = m2o_name(df["employee_id"])
-    return df, None
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando actividades del equipo...")
-def load_team_activities(team_ids: list[int]):
-    """Actividades PENDIENTES (mail.activity) de crm.lead. Es una FOTO del
-    backlog actual, no un histórico — Odoo borra la actividad al marcarla
-    hecha (queda como mensaje en el chatter, no como registro consultable
-    por mes). Mismo límite ya documentado en tablero_soporte_firefly."""
-    cols = ["res_id", "activity_type_id", "user_id", "date_deadline", "create_date"]
-    try:
-        df = search_read("mail.activity", [("res_model", "=", "crm.lead")], cols)
-    except Exception as e:
-        return pd.DataFrame(columns=cols), f"No se pudo consultar actividades (mail.activity): {e}"
-    if df.empty:
-        return df, None
-    df["tipo"] = m2o_name(df["activity_type_id"])
-    df["vendedor"] = m2o_name(df["user_id"])
-    df["date_deadline"] = pd.to_datetime(df["date_deadline"])
-    df["mes"] = df["date_deadline"].dt.to_period("M").astype(str)
-
-    # Solo se piden los leads referenciados por estas actividades (no toda
-    # la tabla crm.lead), para no lanzar un search_read sin dominio sobre
-    # una tabla que puede tener miles de registros.
-    res_ids = sorted({int(rid) for rid in df["res_id"].dropna().unique()})
-    leads_domain = [("id", "in", res_ids)]
-    if team_ids:
-        leads_domain.append(("team_id", "in", team_ids))
-    leads_teams = search_read("crm.lead", leads_domain, ["id", "team_id"]) if res_ids else pd.DataFrame(columns=["id", "team_id"])
-    if leads_teams.empty:
-        return df.iloc[0:0], None
-    leads_teams["equipo"] = m2o_name(leads_teams["team_id"])
-    # inner join: si se pidió un team_ids, esto ya deja solo esos equipos;
-    # si no se pidió, deja solo actividades cuyo lead se pudo resolver.
-    df = df.merge(leads_teams[["id", "equipo"]], left_on="res_id", right_on="id", how="inner")
-    return df, None
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando metas por línea...")
-def load_metas_lineas() -> pd.DataFrame:
-    try:
-        df = pd.read_csv("data/metas_lineas.csv")
-        df["linea"] = df["linea"].str.strip()
-        return df
-    except FileNotFoundError:
-        return pd.DataFrame(columns=["linea", "meta_anual"])
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando costos fijos por línea...")
-def load_costos_fijos() -> pd.DataFrame:
-    try:
-        df = pd.read_csv("data/costos_fijos.csv")
-        df["linea"] = df["linea"].str.strip()
-        return df
-    except FileNotFoundError:
-        return pd.DataFrame(columns=["linea", "persona", "costo_mensual"])
-
-
-# ─────────────────────────────────────────────
-# Sidebar: filtros globales
+# Sidebar
 # ─────────────────────────────────────────────
 st.sidebar.title("⚙️ Filtros")
 
@@ -481,144 +98,179 @@ st.sidebar.caption(f"Datos cacheados por 10 min · {datetime.now():%H:%M}")
 teams_df = load_teams()
 metas_lineas = load_metas_lineas()
 costos_fijos = load_costos_fijos()
+team_ids = all_team_ids(teams_df)
 
 if metas_lineas.empty or (metas_lineas["meta_anual"] == 0).all():
-    st.sidebar.warning("⚠️ Completa `data/metas_lineas.csv` con las metas anuales reales de cada línea.")
+    st.sidebar.warning("Completa `data/metas_lineas.csv` con las metas anuales reales.")
+if not costos_fijos.empty and (costos_fijos["costo_mensual"] == 0).all():
+    st.sidebar.info("Los costos fijos de Diego/Paula están en 0. Actualiza `data/costos_fijos.csv` cuando Raquel confirme el valor.")
+
+missing_teams = [LINEA_TEAM[l] for l in LINEA_TEAM if team_id_for_linea(teams_df, l) is None]
+if missing_teams:
+    st.sidebar.error("No encontré estos equipos en Odoo: " + ", ".join(missing_teams))
 
 d1, d2 = f"{anio}-01-01", f"{anio}-12-31"
 desde_12m = (pd.Period(hoy, freq="M") - 11).to_timestamp().date().isoformat()
 hoy_iso = hoy.isoformat()
+months_year = [f"{anio}-{m:02d}" for m in range(1, 13)]
+meses_12 = month_list(desde_12m, 12)
+meses_6fwd = [str(pd.Period(hoy, freq="M") + i) for i in range(1, 7)]
+mes_actual_key = f"{hoy.year}-{hoy.month:02d}"
+
+# ─────────────────────────────────────────────
+# Carga única (compartida por todas las pestañas)
+# ─────────────────────────────────────────────
+sales_all = load_sales(d1, d2, team_ids)
+won_all = load_won(d1, d2, team_ids)
+won_12m = load_won(desde_12m, hoy_iso, team_ids)
+leads_all = load_leads_full(d1, d2, team_ids)
+pipeline = load_open_pipeline(team_ids)
+inv_extra = invoice_ids_from_sales(sales_all)
+invoices_all = load_invoices(d1, d2, team_ids, extra_ids=inv_extra or None)
+# Reclasificar facturas sin equipo usando la OV de origen
+if not invoices_all.empty and not sales_all.empty and "invoice_ids" in sales_all.columns:
+    so_linea = {}
+    for _, row in sales_all.iterrows():
+        for iid in (row.get("invoice_ids") or []):
+            so_linea[int(iid)] = row["linea"]
+    if so_linea and "id" in invoices_all.columns:
+        from_so = invoices_all["id"].map(so_linea)
+        invoices_all["linea"] = invoices_all["linea"].where(
+            invoices_all["linea"] != "Sin línea", from_so
+        ).fillna(invoices_all["linea"])
+
+costos_analytic, err_costo = load_analytic_costs(d1, d2)
+staff_req, err_staff = load_staffing_requests()
+staff_team_id = team_id_for_linea(teams_df, "Staff")
+subs_df, err_subs = load_subscriptions(staff_team_id)
+renewals, err_ren = load_staffing_renewals(d1, d2)
+sub_logs, err_logs = load_subscription_logs(d1, d2, team_ids)
+projects, err_proj = load_projects(d1, d2)
 
 st.title("📋 Dashboard Staff, Formación y Fábrica de Software")
-st.caption(f"Año analizado: {anio} · Línea = equipo de venta en Odoo (crm.team) · "
-           "Actualiza `data/metas_lineas.csv` y `data/costos_fijos.csv` para afinar cumplimiento y rentabilidad.")
+st.caption(
+    f"Año {anio} · línea = equipo CRM ({', '.join(LINEA_TEAM.values())}) "
+    f"o `service_line` / solicitud Staff · "
+    f"cuentas analíticas: {', '.join(LINEA_ANALYTIC.values())}"
+)
 
 
 # ─────────────────────────────────────────────
-# Helpers compartidos por las pestañas de línea (Staff / Formación / Fábrica)
+# Bloques reutilizables
 # ─────────────────────────────────────────────
-
-def kpis_linea(linea: str, team_id: int | None, sales_year: pd.DataFrame, invoices_year: pd.DataFrame,
-                leads_full_year: pd.DataFrame) -> dict:
-    meta_row = metas_lineas.loc[metas_lineas["linea"] == linea, "meta_anual"]
-    meta_anual = float(meta_row.iloc[0]) if not meta_row.empty else 0.0
-    # "Vendido" = órdenes de venta CONFIRMADAS (sale.order.amount_total), no el
-    # expected_revenue de la oportunidad en CRM — ver load_sales.
-    vendido_anual = sales_year["amount_total"].sum() if not sales_year.empty else 0.0
-    facturado_anual = invoices_year["amount_total_signed"].sum() if not invoices_year.empty else 0.0
-    pct_cumpl = (vendido_anual / meta_anual * 100) if meta_anual else 0.0
-    mes_actual_key = f"{hoy.year}-{hoy.month:02d}"
-    leads_mes = leads_full_year.loc[leads_full_year["mes"] == mes_actual_key].shape[0] if not leads_full_year.empty else 0
+def kpis_linea(linea: str) -> dict:
+    sales = filtro_linea(sales_all, linea)
+    invoices = filtro_linea(invoices_all, linea)
+    leads = filtro_linea(leads_all, linea)
+    meta = meta_anual_de(metas_lineas, linea)
+    vendido = float(sales["amount_total"].sum()) if not sales.empty else 0.0
+    facturado = float(invoices["amount_total_signed"].sum()) if not invoices.empty else 0.0
+    leads_mes = int(leads.loc[leads["mes"] == mes_actual_key].shape[0]) if not leads.empty else 0
     return {
-        "meta_anual": meta_anual, "vendido_anual": vendido_anual,
-        "facturado_anual": facturado_anual, "pct_cumpl": pct_cumpl, "leads_mes": leads_mes,
+        "meta_anual": meta,
+        "vendido_anual": vendido,
+        "facturado_anual": facturado,
+        "pct_cumpl": (vendido / meta * 100) if meta else 0.0,
+        "leads_mes": leads_mes,
+        "sales": sales,
+        "invoices": invoices,
+        "leads": leads,
+        "won": filtro_linea(won_all, linea),
     }
 
 
-def rentabilidad_mensual_linea(linea: str, invoices_year: pd.DataFrame, costos_analytic: pd.DataFrame,
-                                costos_fijos_df: pd.DataFrame, months: list[str]) -> pd.DataFrame:
-    fact_mensual = (invoices_year.groupby("mes", as_index=False)["amount_total_signed"].sum()
-                    .rename(columns={"amount_total_signed": "facturado"})) if not invoices_year.empty else pd.DataFrame(columns=["mes", "facturado"])
-    costo_mensual = (costos_analytic[costos_analytic["linea"] == linea].groupby("mes", as_index=False)["costo"].sum()
-                     if costos_analytic is not None and not costos_analytic.empty else pd.DataFrame(columns=["mes", "costo"]))
-    costo_fijo_mensual = costos_fijos_df.loc[costos_fijos_df["linea"] == linea, "costo_mensual"].sum()
-
-    base = pd.DataFrame({"mes": months})
-    tabla = base.merge(fact_mensual, on="mes", how="left").merge(costo_mensual, on="mes", how="left")
+def rentabilidad_contable(linea: str) -> pd.DataFrame:
+    invoices = filtro_linea(invoices_all, linea)
+    fact_mensual = (
+        invoices.groupby("mes", as_index=False)["amount_total_signed"].sum()
+        .rename(columns={"amount_total_signed": "facturado"})
+        if not invoices.empty else pd.DataFrame(columns=["mes", "facturado"])
+    )
+    costo_m = (
+        costos_analytic[costos_analytic["linea"] == linea].groupby("mes", as_index=False)["costo"].sum()
+        if costos_analytic is not None and not costos_analytic.empty
+        else pd.DataFrame(columns=["mes", "costo"])
+    )
+    fijo = costo_fijo_de(costos_fijos, linea)
+    tabla = pd.DataFrame({"mes": months_year}).merge(fact_mensual, on="mes", how="left").merge(costo_m, on="mes", how="left")
     tabla["facturado"] = tabla["facturado"].fillna(0)
-    tabla["costo"] = tabla["costo"].fillna(0) + costo_fijo_mensual
+    tabla["costo"] = tabla["costo"].fillna(0) + fijo
     tabla["rentabilidad"] = tabla["facturado"] - tabla["costo"]
     return tabla
 
 
-def render_linea_tab(linea: str, extra_kpi_label: str, extra_kpi_value):
-    team_id = team_id_for_linea(teams_df, linea)
-    if team_id is None:
-        st.warning(f"No encontré un equipo de venta llamado **{LINEA_TEAM[linea]}** en Odoo (crm.team). "
-                   f"Ajusta `LINEA_TEAM` en el código si el nombre real es distinto, o créalo en Odoo.")
-        team_ids = []
-    else:
-        team_ids = [team_id]
-
-    sales_year = load_sales(d1, d2, team_ids)
-    won_year = load_won(d1, d2, team_ids)
-    invoices_year = load_invoices(d1, d2, team_ids)
-    leads_full_year = load_leads_full(d1, d2, team_ids)
-    costos_analytic, err_costo = load_analytic_costs(d1, d2)
-
-    k = kpis_linea(linea, team_id, sales_year, invoices_year, leads_full_year)
-    c0, c1, c2, c3, c4 = st.columns(5)
-    c0.metric(extra_kpi_label, extra_kpi_value)
-    c1.metric("Cumplimiento meta anual", f"{k['pct_cumpl']:.1f}%")
-    c2.metric(f"Vendido en {linea} (año)", fmt_money(k["vendido_anual"]))
-    c3.metric("Facturación acumulada (año)", fmt_money(k["facturado_anual"]))
-    c4.metric("Leads del mes", k["leads_mes"])
-    st.caption("\"Vendido\" = órdenes de venta confirmadas (sale.order), no el valor estimado de "
-              "la oportunidad en CRM — así lo pidió el responsable del proceso: el valor "
-              "verdadero de la venta lo tiene la orden, no la iniciativa/oportunidad.")
-
+def chart_venta_vs_meta(linea: str, sales: pd.DataFrame):
     st.markdown("#### 💰 Cierre de venta mes a mes vs. meta")
-    meta_row = metas_lineas.loc[metas_lineas["linea"] == linea, "meta_anual"]
-    meta_mensual = (float(meta_row.iloc[0]) / 12) if not meta_row.empty else 0.0
-    months_year = [f"{anio}-{m:02d}" for m in range(1, 13)]
-    ventas_mes = (sales_year.groupby("mes", as_index=False)["amount_total"].sum()
-                 if not sales_year.empty else pd.DataFrame(columns=["mes", "amount_total"]))
-    base_meses = pd.DataFrame({"mes": months_year})
-    ventas_vs_meta = base_meses.merge(ventas_mes, on="mes", how="left")
-    ventas_vs_meta["amount_total"] = ventas_vs_meta["amount_total"].fillna(0)
-    ventas_vs_meta["meta_mensual"] = meta_mensual
-    largo = ventas_vs_meta.melt(id_vars="mes", value_vars=["meta_mensual", "amount_total"],
-                                 var_name="concepto", value_name="valor")
+    meta_m = meta_anual_de(metas_lineas, linea) / 12
+    ventas_mes = (
+        sales.groupby("mes", as_index=False)["amount_total"].sum()
+        if not sales.empty else pd.DataFrame(columns=["mes", "amount_total"])
+    )
+    base = pd.DataFrame({"mes": months_year}).merge(ventas_mes, on="mes", how="left")
+    base["amount_total"] = base["amount_total"].fillna(0)
+    base["meta_mensual"] = meta_m
+    largo = base.melt(id_vars="mes", value_vars=["meta_mensual", "amount_total"],
+                      var_name="concepto", value_name="valor")
     largo["concepto"] = largo["concepto"].map({"meta_mensual": "Meta mensual", "amount_total": "Vendido"})
-    fig = px.bar(largo, x="mes", y="valor", color="concepto", barmode="group",
-                 title=f"{linea} — vendido (OV) vs. meta mensual ({anio})",
-                 color_discrete_map={"Meta mensual": "#9ca3af", "Vendido": "#1f77b4"},
-                 labels={"valor": "COP", "mes": "Mes"})
+    fig = px.bar(
+        largo, x="mes", y="valor", color="concepto", barmode="group",
+        title=f"{linea} — vendido (OV) vs. meta mensual ({anio})",
+        color_discrete_map={"Meta mensual": "#9ca3af", "Vendido": "#1f77b4"},
+        labels={"valor": "COP", "mes": "Mes"},
+    )
     st.plotly_chart(fig, use_container_width=True)
 
+
+def chart_fact_y_leads(linea: str, invoices: pd.DataFrame, leads: pd.DataFrame):
     col_a, col_b = st.columns(2)
     with col_a:
         st.markdown("#### 🧾 Facturación mes a mes")
-        if invoices_year.empty:
-            st.info("No hay facturas en el período.")
+        if invoices.empty:
+            st.info("No hay facturas clasificadas en esta línea.")
         else:
-            fact_mes = invoices_year.groupby("mes", as_index=False)["amount_total_signed"].sum()
+            fact_mes = invoices.groupby("mes", as_index=False)["amount_total_signed"].sum()
             fig = px.bar(fact_mes, x="mes", y="amount_total_signed", text_auto=".2s",
-                         title=f"{linea} — facturación por mes ({anio})",
+                         title=f"{linea} — facturación ({anio})",
                          labels={"amount_total_signed": "COP", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
     with col_b:
         st.markdown("#### 📨 Leads mes a mes")
-        if leads_full_year.empty:
-            st.info("No hay leads en el período.")
+        if leads.empty:
+            st.info("No hay leads de este equipo. Paula: revisar asignación de equipo CRM.")
         else:
-            leads_mes_df = leads_full_year.groupby("mes", as_index=False).agg(leads=("name", "count"))
-            fig = px.bar(leads_mes_df, x="mes", y="leads", text_auto=True,
-                         title=f"{linea} — leads nuevos por mes ({anio})",
+            leads_mes = leads.groupby("mes", as_index=False).agg(leads=("name", "count"))
+            fig = px.bar(leads_mes, x="mes", y="leads", text_auto=True,
+                         title=f"{linea} — leads nuevos ({anio})",
                          labels={"leads": "Leads", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("#### 🌐 Leads por origen y mes")
-    if leads_full_year.empty:
-        st.info("No hay leads en el período.")
-    else:
-        origen_mes = leads_full_year.groupby(["mes", "origen"], as_index=False).agg(leads=("name", "count"))
-        fig = px.bar(origen_mes, x="mes", y="leads", color="origen", barmode="stack",
-                     title=f"{linea} — leads por origen y mes ({anio})",
-                     labels={"leads": "Leads", "mes": "Mes"})
-        st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("#### 📈 Rentabilidad mensual")
-    st.caption("Facturado − costos de proveedores/equipo (cuenta analítica) − costo fijo asignado "
-               "a la línea (`data/costos_fijos.csv`). Variación mes a mes, no acumulada.")
+def chart_leads_origen(linea: str, leads: pd.DataFrame):
+    st.markdown("#### 🌐 Leads por origen y mes")
+    if leads.empty:
+        st.info("No hay leads en el período.")
+        return
+    origen_mes = leads.groupby(["mes", "origen"], as_index=False).agg(leads=("name", "count"))
+    fig = px.bar(origen_mes, x="mes", y="leads", color="origen", barmode="stack",
+                 title=f"{linea} — leads por origen y mes ({anio})",
+                 labels={"leads": "Leads", "mes": "Mes"})
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def chart_rentabilidad_contable(linea: str):
+    st.markdown("#### 📈 Rentabilidad mensual (facturación − analítica − costo fijo)")
+    st.caption(
+        "Facturado − costos de `account.analytic.line` en la cuenta de la línea "
+        f"({LINEA_ANALYTIC[linea]}) − costo fijo de `data/costos_fijos.csv`."
+    )
     if err_costo:
         st.warning(err_costo)
-    rent = rentabilidad_mensual_linea(linea, invoices_year, costos_analytic, costos_fijos, months_year)
+    rent = rentabilidad_contable(linea)
     fig = px.bar(rent, x="mes", y="rentabilidad", text_auto=".2s",
-                 title=f"{linea} — rentabilidad mensual ({anio})",
+                 title=f"{linea} — rentabilidad contable ({anio})",
                  labels={"rentabilidad": "COP", "mes": "Mes"})
     st.plotly_chart(fig, use_container_width=True)
-    with st.expander("📋 Detalle de rentabilidad mensual"):
+    with st.expander("Detalle de rentabilidad mensual"):
         st.dataframe(
             rent, use_container_width=True, hide_index=True,
             column_config={
@@ -629,26 +281,67 @@ def render_linea_tab(linea: str, extra_kpi_label: str, extra_kpi_value):
             },
         )
 
-    with st.expander("📋 Detalle de órdenes de venta del año (fuente de \"Vendido\")"):
-        if sales_year.empty:
-            st.caption("Sin órdenes de venta confirmadas en el período.")
-        else:
-            st.dataframe(
-                sales_year[["name", "date_order", "vendedor", "cliente", "amount_untaxed", "amount_total"]],
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "name": "Orden", "date_order": "Fecha", "vendedor": "Vendedor", "cliente": "Cliente",
-                    "amount_untaxed": st.column_config.NumberColumn("Sin impuestos", format="$%,.0f"),
-                    "amount_total": st.column_config.NumberColumn("Total", format="$%,.0f"),
-                },
-            )
 
-    with st.expander("📋 Detalle de oportunidades ganadas del año (CRM, solo informativo)"):
-        if won_year.empty:
-            st.caption("Sin oportunidades ganadas en el período.")
-        else:
-            st.dataframe(won_year[["name", "date_closed", "vendedor", "cliente", "expected_revenue"]],
-                         use_container_width=True, hide_index=True)
+def chart_vendidos_y_proyeccion(linea: str, label: str, col_name: str):
+    """Histórico = oportunidades ganadas. Proyección = pipeline con date_deadline (CRM)."""
+    st.markdown(f"#### 📈 {label} vendidos (últimos 12 meses) y proyección (próximos 6)")
+    st.caption(
+        "Histórico = oportunidades GANADAS (`crm.lead.won_status`). "
+        "Proyección = oportunidades ABIERTAS con fecha de cierre esperada (`date_deadline`) "
+        "en los próximos 6 meses — no es un promedio móvil."
+    )
+    hist = filtro_linea(won_12m, linea)
+    if hist.empty:
+        st.info(f"No hay {label.lower()} (oportunidades ganadas) en los últimos 12 meses.")
+    else:
+        mensual = hist.groupby("mes", as_index=False).agg(**{col_name: ("name", "count")})
+        mensual["tipo"] = "Histórico (ganadas)"
+    pipe = filtro_linea(pipeline, linea)
+    pipe_ok = pipe[pipe["date_deadline"].notna()] if not pipe.empty else pipe
+    pipe_ok = pipe_ok[pipe_ok["mes"].isin(meses_6fwd)] if not pipe_ok.empty else pipe_ok
+    if pipe_ok is not None and not pipe_ok.empty:
+        proy = pipe_ok.groupby("mes", as_index=False).agg(**{col_name: ("name", "count")})
+        proy["tipo"] = "Proyección (pipeline CRM)"
+    else:
+        proy = pd.DataFrame(columns=["mes", col_name, "tipo"])
+
+    partes = []
+    if not hist.empty:
+        partes.append(mensual)
+    if not proy.empty:
+        partes.append(proy)
+    if not partes:
+        st.info("Sin histórico ni pipeline con fecha de cierre para proyectar.")
+        return
+    combinado = pd.concat(partes, ignore_index=True)
+    fig = px.bar(combinado, x="mes", y=col_name, color="tipo",
+                 title=f"{label} por mes — histórico y proyección",
+                 labels={col_name: label, "mes": "Mes"})
+    st.plotly_chart(fig, use_container_width=True)
+    if pipe.empty or pipe["date_deadline"].isna().all():
+        st.warning("El pipeline abierto no tiene `date_deadline`. Paula: completar la fecha de cierre esperada para que la proyección deje de estar vacía.")
+    elif not pipe.empty:
+        sin_fecha = int(pipe["date_deadline"].isna().sum())
+        if sin_fecha:
+            st.caption(f"{sin_fecha} oportunidades abiertas de {linea} no tienen fecha de cierre — no entran a la proyección.")
+
+
+def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
+    k = kpis_linea(linea)
+    c0, c1, c2, c3, c4 = st.columns(5)
+    c0.metric(extra_kpi_label, extra_kpi_value)
+    c1.metric("Cumplimiento meta anual", f"{k['pct_cumpl']:.1f}%")
+    c2.metric(f"Vendido en {linea} (año)", fmt_money(k["vendido_anual"]))
+    c3.metric("Facturación acumulada (año)", fmt_money(k["facturado_anual"]))
+    c4.metric("Leads del mes", k["leads_mes"])
+    st.caption(
+        '"Vendido" = órdenes confirmadas (`sale.order`). Si el equipo de venta aún no está '
+        "asignado, se clasifica por `service_line` o por la solicitud Staff."
+    )
+    chart_venta_vs_meta(linea, k["sales"])
+    chart_fact_y_leads(linea, k["invoices"], k["leads"])
+    chart_leads_origen(linea, k["leads"])
+    return k
 
 
 # ─────────────────────────────────────────────
@@ -658,49 +351,48 @@ tab_resumen, tab_staff, tab_formacion, tab_fabrica, tab_equipo, tab_vendedor = s
     ["🏠 Resumen", "👥 Staff", "🎓 Formación", "💻 Fábrica de Software", "🕐 Equipo", "🏆 Vendedores"]
 )
 
-# --- Resumen ejecutivo -------------------------------------------------
+# --- Resumen: responde las 6 preguntas --------------------------------
 with tab_resumen:
-    st.caption("Comparativo de las 3 líneas. Usa el año seleccionado en la barra lateral.")
+    st.markdown("### Las preguntas del informe")
+    st.caption("Respuestas calculadas con Odoo en vivo + metas/costos fijos del CSV.")
 
-    sales_all_lineas = []
-    fact_all_lineas = []
-    leads_all_lineas = []
-    for linea in LINEA_TEAM:
-        tid = team_id_for_linea(teams_df, linea)
-        ids = [tid] if tid else []
-        s = load_sales(d1, d2, ids)
-        if not s.empty:
-            sales_all_lineas.append(s.assign(linea=linea))
-        f = load_invoices(d1, d2, ids)
-        if not f.empty:
-            f = f.assign(linea=linea)
-            fact_all_lineas.append(f)
-        l = load_leads_full(d1, d2, ids)
-        if not l.empty:
-            l = l.assign(linea=linea)
-            leads_all_lineas.append(l)
-
-    sales_all = pd.concat(sales_all_lineas, ignore_index=True) if sales_all_lineas else pd.DataFrame(columns=["mes", "linea", "amount_total"])
-    fact_all = pd.concat(fact_all_lineas, ignore_index=True) if fact_all_lineas else pd.DataFrame(columns=["mes", "linea", "amount_total_signed"])
-    leads_all = pd.concat(leads_all_lineas, ignore_index=True) if leads_all_lineas else pd.DataFrame(columns=["mes", "linea", "name"])
-
-    st.markdown("#### 🎯 Cumplimiento de meta anual por línea")
-    st.caption("\"Vendido\" = órdenes de venta confirmadas (sale.order), no el expected_revenue "
-              "de la oportunidad en CRM — el valor verdadero de la venta lo tiene la orden, no "
-              "la iniciativa/oportunidad (confirmado con el responsable del proceso).")
     resumen_rows = []
+    rent_ytd = {}
     for linea in LINEA_TEAM:
-        meta_row = metas_lineas.loc[metas_lineas["linea"] == linea, "meta_anual"]
-        meta_anual = float(meta_row.iloc[0]) if not meta_row.empty else 0.0
-        vendido = sales_all.loc[sales_all["linea"] == linea, "amount_total"].sum() if not sales_all.empty else 0.0
-        facturado = fact_all.loc[fact_all["linea"] == linea, "amount_total_signed"].sum() if not fact_all.empty else 0.0
+        k = kpis_linea(linea)
+        rent = rentabilidad_contable(linea)
+        # Para Staff, el neto operativo de plazas es más fiel que el contable
+        if linea == "Staff" and staff_req is not None and not staff_req.empty:
+            pnl = staffing_pnl_monthly(staff_req, months_year, costo_fijo_de(costos_fijos, "Staff"))
+            neto = float(pnl["neto"].sum())
+        else:
+            neto = float(rent["rentabilidad"].sum())
+        rent_ytd[linea] = neto
         resumen_rows.append({
-            "linea": linea, "meta_anual": meta_anual, "vendido": vendido, "facturado": facturado,
-            "pct_cumpl": (vendido / meta_anual * 100) if meta_anual else 0.0,
+            "linea": linea,
+            "meta_anual": k["meta_anual"],
+            "vendido": k["vendido_anual"],
+            "facturado": k["facturado_anual"],
+            "pct_cumpl": k["pct_cumpl"],
+            "leads_mes": k["leads_mes"],
+            "neto_ytd": neto,
         })
     resumen_df = pd.DataFrame(resumen_rows)
+
+    # 1. ¿Cumplimos metas?
+    st.markdown("#### 1. ¿Estamos cumpliendo las metas de ventas anuales?")
+    cols = st.columns(3)
+    for i, row in resumen_df.iterrows():
+        with cols[i]:
+            st.metric(
+                f"{semaforo(row['pct_cumpl'])} {row['linea']}",
+                f"{row['pct_cumpl']:.1f}%",
+                help=f"Vendido {fmt_money(row['vendido'])} de meta {fmt_money(row['meta_anual'])}",
+            )
+            st.caption(f"{fmt_money(row['vendido'])} / {fmt_money(row['meta_anual'])}")
     st.dataframe(
-        resumen_df, use_container_width=True, hide_index=True,
+        resumen_df[["linea", "meta_anual", "vendido", "facturado", "pct_cumpl"]],
+        use_container_width=True, hide_index=True,
         column_config={
             "linea": "Línea",
             "meta_anual": st.column_config.NumberColumn("Meta año", format="$%,.0f"),
@@ -710,157 +402,344 @@ with tab_resumen:
         },
     )
 
+    # 2. Plazas
+    st.markdown("#### 2. ¿Cuántas plazas activas tenemos y qué esperamos en los próximos meses?")
+    plazas_hoy = 0
+    fuente_plazas = "suscripciones"
+    if staff_req is not None and not staff_req.empty:
+        plazas_hoy = int((staff_req["state"] == "confirmed").sum())
+        fuente_plazas = "firefly.staffing.request (confirmadas)"
+        hist_plazas = staffing_coverage(staff_req, meses_12)
+        proy_plazas = staffing_coverage(staff_req, meses_6fwd, states=("confirmed",))
+    elif subs_df is not None and not subs_df.empty:
+        plazas_hoy = int(subs_df["subscription_state"].isin(["3_progress", "4_paused"]).sum())
+        fuente_plazas = "sale.order suscripciones en progreso"
+        hist_plazas = subscription_coverage(subs_df, meses_12)
+        proy_plazas = subscription_coverage(subs_df, meses_6fwd)
+    else:
+        hist_plazas = pd.DataFrame(columns=["mes", "activas"])
+        proy_plazas = pd.DataFrame(columns=["mes", "activas"])
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Plazas activas hoy", plazas_hoy)
+    if not proy_plazas.empty:
+        c2.metric("Plazas proyectadas a 6 meses", int(proy_plazas["activas"].iloc[-1]))
+        delta = int(proy_plazas["activas"].iloc[-1] - plazas_hoy)
+        c3.metric("Variación esperada", f"{delta:+d}")
+    st.caption(f"Fuente: {fuente_plazas}. La proyección solo cuenta plazas YA vendidas con vigencia futura (no ventas nuevas).")
+    if err_staff:
+        st.warning(err_staff)
+    if not hist_plazas.empty:
+        combo = pd.concat([
+            hist_plazas.assign(tipo="Histórico 12 meses"),
+            proy_plazas.assign(tipo="Proyección 6 meses"),
+        ], ignore_index=True)
+        fig = px.line(combo, x="mes", y="activas", color="tipo", markers=True,
+                      title="Plazas activas — histórico y proyección",
+                      labels={"activas": "Plazas", "mes": "Mes"})
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 3. Rentabilidad
+    st.markdown("#### 3. ¿Las líneas son rentables?")
+    rcols = st.columns(3)
+    for i, linea in enumerate(LINEA_TEAM):
+        neto = rent_ytd[linea]
+        with rcols[i]:
+            st.metric(
+                f"{'🟢' if neto >= 0 else '🔴'} Neto YTD · {linea}",
+                fmt_money(neto),
+            )
+    st.caption(
+        "Staff: ingreso mensual de plazas − costo del recurso (proveedor) − fijo de Diego "
+        "(módulo `firefly_staffing`). Formación y Fábrica: facturado − analítica − fijo. "
+        "El costo de Diego/Paula está en 0 hasta que Raquel confirme el valor."
+    )
+
+    # 4 y 5. Origen y leads
+    st.markdown("#### 4 y 5. ¿De dónde vienen las oportunidades? ¿Llegan leads a cada línea?")
     col1, col2 = st.columns(2)
     with col1:
-        if not fact_all.empty:
-            mensual = fact_all.groupby(["mes", "linea"], as_index=False)["amount_total_signed"].sum()
-            fig = px.bar(mensual, x="mes", y="amount_total_signed", color="linea", barmode="group",
-                         title="Facturación mes a mes por línea", labels={"amount_total_signed": "COP", "mes": "Mes"})
+        if leads_all.empty:
+            st.info("Sin leads clasificados. Paula: asignar equipo CRM (Staffing IT / FORMACION / FABRICA SOFTWARE).")
+        else:
+            origen = leads_all.groupby(["linea", "origen"], as_index=False).agg(leads=("name", "count"))
+            fig = px.bar(origen, x="origen", y="leads", color="linea", barmode="group",
+                         title="Leads del año por origen y línea",
+                         labels={"leads": "Leads", "origen": "Origen"})
             st.plotly_chart(fig, use_container_width=True)
+            top = (leads_all.groupby("origen", as_index=False).agg(leads=("name", "count"))
+                   .sort_values("leads", ascending=False).head(5))
+            st.caption("Afianzar los orígenes con más volumen: " + ", ".join(top["origen"].tolist()))
     with col2:
+        if leads_all.empty:
+            st.info("Sin leads del mes.")
+        else:
+            leads_mes_l = (leads_all[leads_all["mes"] == mes_actual_key]
+                           .groupby("linea", as_index=False).agg(leads=("name", "count")))
+            fig = px.bar(leads_mes_l, x="linea", y="leads", text_auto=True,
+                         title="Leads del mes actual por línea",
+                         labels={"leads": "Leads", "linea": "Línea"})
+            st.plotly_chart(fig, use_container_width=True)
+            if not won_all.empty:
+                abiertas = (leads_all[leads_all["estado"] == "Abierta"]
+                            .groupby("linea", as_index=False)
+                            .agg(pipeline=("expected_revenue", "sum")))
+                fig = px.bar(abiertas, x="linea", y="pipeline", text_auto=".2s",
+                             title="Pipeline abierto por línea",
+                             labels={"pipeline": "COP", "linea": "Línea"})
+                st.plotly_chart(fig, use_container_width=True)
+
+    # 6. Tiempo vs resultado
+    st.markdown("#### 6. ¿El equipo dedica tiempo a cada línea y se ven resultados?")
+    horas_df, err_horas_res = load_analytic_hours(d1, d2)
+    if err_horas_res:
+        st.warning(err_horas_res)
+    elif horas_df.empty:
+        st.info("No hay partes de horas en las cuentas analíticas de las 3 líneas.")
+    else:
+        horas_l = horas_df.groupby("linea", as_index=False)["unit_amount"].sum()
+        mix = resumen_df.merge(horas_l, on="linea", how="left")
+        mix["unit_amount"] = mix["unit_amount"].fillna(0)
+        mix["cop_por_hora"] = mix.apply(
+            lambda r: r["vendido"] / r["unit_amount"] if r["unit_amount"] else 0, axis=1
+        )
+        fig = px.bar(mix, x="linea", y="unit_amount", text_auto=".1f",
+                     title="Horas del año por línea (timesheet analítico)",
+                     labels={"unit_amount": "Horas", "linea": "Línea"})
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(
+            mix[["linea", "unit_amount", "vendido", "cop_por_hora", "pct_cumpl"]],
+            use_container_width=True, hide_index=True,
+            column_config={
+                "linea": "Línea",
+                "unit_amount": st.column_config.NumberColumn("Horas", format="%.1f"),
+                "vendido": st.column_config.NumberColumn("Vendido", format="$%,.0f"),
+                "cop_por_hora": st.column_config.NumberColumn("COP vendido / hora", format="$%,.0f"),
+                "pct_cumpl": st.column_config.NumberColumn("% meta", format="%.1f%%"),
+            },
+        )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if not invoices_all.empty:
+            mensual = invoices_all[invoices_all["linea"] != "Sin línea"].groupby(
+                ["mes", "linea"], as_index=False)["amount_total_signed"].sum()
+            fig = px.bar(mensual, x="mes", y="amount_total_signed", color="linea", barmode="group",
+                         title="Facturación mes a mes por línea",
+                         labels={"amount_total_signed": "COP", "mes": "Mes"})
+            st.plotly_chart(fig, use_container_width=True)
+    with col_b:
         if not sales_all.empty:
-            mensual_v = sales_all.groupby(["mes", "linea"], as_index=False)["amount_total"].sum()
+            mensual_v = sales_all[sales_all["linea"] != "Sin línea"].groupby(
+                ["mes", "linea"], as_index=False)["amount_total"].sum()
             fig = px.bar(mensual_v, x="mes", y="amount_total", color="linea", barmode="group",
-                         title="Vendido (órdenes de venta) mes a mes por línea",
+                         title="Vendido (OV) mes a mes por línea",
                          labels={"amount_total": "COP", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
-
-    if not leads_all.empty:
-        mes_actual_key = f"{hoy.year}-{hoy.month:02d}"
-        leads_mes_linea = (leads_all[leads_all["mes"] == mes_actual_key].groupby("linea", as_index=False)
-                           .agg(leads=("name", "count")))
-        col3, col4 = st.columns(2)
-        with col3:
-            fig = px.bar(leads_mes_linea, x="linea", y="leads", text_auto=True,
-                         title="Leads del mes actual por línea", labels={"leads": "Leads", "linea": "Línea"})
-            st.plotly_chart(fig, use_container_width=True)
-        with col4:
-            abiertas_linea = (leads_all[leads_all["estado"] == "Abierta"].groupby("linea", as_index=False)
-                              .agg(pipeline=("expected_revenue", "sum")))
-            fig = px.bar(abiertas_linea, x="linea", y="pipeline", text_auto=".2s",
-                         title="Pipeline abierto por línea", labels={"pipeline": "COP", "linea": "Línea"})
-            st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("#### 👥 Plazas activas de Staff, mes a mes (últimos 12 meses)")
-    staff_team_id = team_id_for_linea(teams_df, "Staff")
-    subs_df, err_subs = load_subscriptions(staff_team_id)
-    if err_subs:
-        st.warning(err_subs)
-    elif subs_df.empty:
-        st.info("No hay suscripciones activas de Staff para calcular plazas.")
-    else:
-        meses_12 = [str(pd.Period(desde_12m, freq="M") + i) for i in range(12)]
-        plazas_12m = coverage_per_month(subs_df, "start_date", "end_date", meses_12,
-                                         state_col="subscription_state", active_states=("3_progress",))
-        fig = px.bar(plazas_12m, x="mes", y="activas", text_auto=True,
-                     title="Plazas activas de Staff por mes", labels={"activas": "Plazas", "mes": "Mes"})
-        st.plotly_chart(fig, use_container_width=True)
 
 
 # --- Staff --------------------------------------------------------------
 with tab_staff:
-    staff_team_id = team_id_for_linea(teams_df, "Staff")
-    subs_df, err_subs = load_subscriptions(staff_team_id)
+    if staff_req is not None and not staff_req.empty:
+        plazas_actuales = int((staff_req["state"] == "confirmed").sum())
+    elif subs_df is not None and not subs_df.empty:
+        plazas_actuales = int(subs_df["subscription_state"].isin(["3_progress", "4_paused"]).sum())
+    else:
+        plazas_actuales = 0
 
-    plazas_actuales = 0
-    if err_subs:
-        st.warning(err_subs)
-    elif not subs_df.empty:
-        plazas_actuales = int((subs_df["subscription_state"] == "3_progress").sum())
+    renov_mes = int(renewals.loc[renewals["mes"] == mes_actual_key].shape[0]) if renewals is not None and not renewals.empty else 0
+    render_linea_comun("Staff", "Plazas activas actualmente", plazas_actuales)
+    st.metric("Suscripciones renovadas este mes", renov_mes)
 
-    render_linea_tab("Staff", "Plazas activas actualmente", plazas_actuales)
-
-    if not err_subs and not subs_df.empty:
-        st.divider()
-        st.markdown("#### 📈 Tendencia de plazas activas (últimos 12 meses) y proyección (próximos 6)")
-        meses_12 = [str(pd.Period(desde_12m, freq="M") + i) for i in range(12)]
-        historico = coverage_per_month(subs_df, "start_date", "end_date", meses_12,
-                                        state_col="subscription_state", active_states=("3_progress",))
-        meses_6fwd = [str(pd.Period(hoy, freq="M") + i) for i in range(1, 7)]
-        proyeccion = coverage_per_month(subs_df, "start_date", "end_date", meses_6fwd,
-                                         state_col="subscription_state", active_states=("3_progress",))
-        historico["tipo"] = "Histórico"
-        proyeccion["tipo"] = "Proyección (plazas ya vendidas con fin definido)"
-        combinado = pd.concat([historico, proyeccion], ignore_index=True)
+    st.divider()
+    st.markdown("#### 📈 Tendencia de plazas (12 meses) y proyección (6 meses, plazas ya vendidas)")
+    if staff_req is not None and not staff_req.empty:
+        historico = staffing_coverage(staff_req, meses_12)
+        proyeccion = staffing_coverage(staff_req, meses_6fwd, states=("confirmed",))
+        fuente = "vigencia `date_start`/`date_end` de firefly.staffing.request"
+    elif subs_df is not None and not subs_df.empty:
+        historico = subscription_coverage(subs_df, meses_12)
+        proyeccion = subscription_coverage(subs_df, meses_6fwd)
+        fuente = "start_date/end_date de suscripciones (sale.order)"
+    else:
+        historico = pd.DataFrame()
+        proyeccion = pd.DataFrame()
+        fuente = ""
+    if historico.empty:
+        st.info("Sin solicitudes Staff ni suscripciones para graficar plazas.")
+        if err_staff:
+            st.warning(err_staff)
+        if err_subs:
+            st.warning(err_subs)
+    else:
+        combinado = pd.concat([
+            historico.assign(tipo="Histórico"),
+            proyeccion.assign(tipo="Proyección (plazas ya vendidas)"),
+        ], ignore_index=True)
         fig = px.line(combinado, x="mes", y="activas", color="tipo", markers=True,
-                     title="Plazas activas — histórico y proyección",
-                     labels={"activas": "Plazas", "mes": "Mes"})
+                      title="Plazas activas — histórico y proyección",
+                      labels={"activas": "Plazas", "mes": "Mes"})
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("La proyección solo refleja plazas YA vendidas con fecha de fin definida en la "
-                   "suscripción; no incluye ventas futuras aún no cerradas.")
-        with st.expander("📋 Detalle de suscripciones de Staff"):
+        st.caption(f"Fuente: {fuente}. No incluye ventas futuras aún no cerradas.")
+
+    st.markdown("#### 🔁 Renovaciones por mes")
+    if err_ren:
+        st.warning(err_ren)
+    if renewals is not None and not renewals.empty:
+        ren_mes = renewals.groupby("mes", as_index=False).agg(renovaciones=("staff", "count"))
+        fig = px.bar(ren_mes, x="mes", y="renovaciones", text_auto=True,
+                     title="Renovaciones Staff (firefly.staffing.history)",
+                     labels={"renovaciones": "Renovaciones", "mes": "Mes"})
+        st.plotly_chart(fig, use_container_width=True)
+    elif sub_logs is not None and not sub_logs.empty:
+        # Transferencia positiva en sale.order.log = renovación confirmada
+        transfers = sub_logs[(sub_logs["event_type"] == "3_transfer") & (sub_logs["amount_signed"] > 0)]
+        if transfers.empty:
+            st.info("No hay renovaciones registradas este año.")
+        else:
+            t_mes = transfers.groupby("mes", as_index=False).agg(renovaciones=("suscripcion", "count"))
+            fig = px.bar(t_mes, x="mes", y="renovaciones", text_auto=True,
+                         title="Renovaciones (sale.order.log, transferencias)",
+                         labels={"renovaciones": "Renovaciones", "mes": "Mes"})
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Sin historial de renovaciones. Paula: revisar que las suscripciones se estén renovando en Odoo.")
+
+    st.markdown("#### 💵 Rentabilidad operativa de Staff (plaza vs. recurso)")
+    st.caption(
+        "Por cada mes de vigencia: valor mensual a cobrar − valor mensual a pagar al proveedor "
+        "− costo fijo de Diego. Es el 'cuánto vale el recurso' que pidió el informe."
+    )
+    if staff_req is not None and not staff_req.empty:
+        pnl = staffing_pnl_monthly(staff_req, months_year, costo_fijo_de(costos_fijos, "Staff"))
+        fig = px.bar(pnl, x="mes", y="neto", text_auto=".2s",
+                     title="Staff — neto operativo mensual (plazas − recurso − Diego)",
+                     labels={"neto": "COP", "mes": "Mes"})
+        st.plotly_chart(fig, use_container_width=True)
+        col_x, col_y = st.columns(2)
+        with col_x:
+            fig = px.bar(pnl, x="mes", y=["ingreso_plazas", "costo_recurso"], barmode="group",
+                         title="Ingreso de plazas vs. costo del recurso",
+                         labels={"value": "COP", "mes": "Mes", "variable": ""})
+            st.plotly_chart(fig, use_container_width=True)
+        with col_y:
+            fig = px.line(pnl, x="mes", y="valor_recurso_promedio", markers=True,
+                          title="Costo promedio del recurso / plaza",
+                          labels={"valor_recurso_promedio": "COP", "mes": "Mes"})
+            st.plotly_chart(fig, use_container_width=True)
+        with st.expander("Detalle P&L operativo Staff"):
             st.dataframe(
-                subs_df[["name", "cliente", "subscription_state", "start_date", "end_date"]],
-                use_container_width=True, hide_index=True,
+                pnl, use_container_width=True, hide_index=True,
+                column_config={
+                    "mes": "Mes", "plazas": "Plazas",
+                    "ingreso_plazas": st.column_config.NumberColumn("Ingreso plazas", format="$%,.0f"),
+                    "costo_recurso": st.column_config.NumberColumn("Costo recurso", format="$%,.0f"),
+                    "costo_fijo": st.column_config.NumberColumn("Costo fijo Diego", format="$%,.0f"),
+                    "neto": st.column_config.NumberColumn("Neto", format="$%,.0f"),
+                    "valor_recurso_promedio": st.column_config.NumberColumn("Recurso promedio", format="$%,.0f"),
+                },
+            )
+        with st.expander("Plazas / solicitudes Staff"):
+            show_cols = [c for c in [
+                "name", "cliente", "rol", "recurso", "state", "date_start", "date_end",
+                "monthly_amount_company_currency", "purchase_amount_company_currency",
+                "margin_company_currency",
+            ] if c in staff_req.columns]
+            st.dataframe(
+                staff_req[show_cols], use_container_width=True, hide_index=True,
+                column_config={
+                    "monthly_amount_company_currency": st.column_config.NumberColumn("Venta mes", format="$%,.0f"),
+                    "purchase_amount_company_currency": st.column_config.NumberColumn("Costo recurso", format="$%,.0f"),
+                    "margin_company_currency": st.column_config.NumberColumn("Margen", format="$%,.0f"),
+                },
             )
     else:
-        st.info("Sin datos de suscripciones para graficar tendencia/proyección de plazas.")
+        st.info("Sin `firefly.staffing.request`. Se muestra solo la rentabilidad contable (abajo).")
+
+    chart_rentabilidad_contable("Staff")
+
+    if subs_df is not None and not subs_df.empty:
+        with st.expander("Suscripciones de Staff"):
+            cols_sub = [c for c in [
+                "name", "cliente", "subscription_state", "start_date", "end_date",
+                "next_invoice_date", "recurring_monthly",
+            ] if c in subs_df.columns]
+            st.dataframe(subs_df[cols_sub], use_container_width=True, hide_index=True)
 
 
 # --- Formación ------------------------------------------------------------
 with tab_formacion:
-    formacion_team_id = team_id_for_linea(teams_df, "Formación")
-    won_year_formacion = load_won(d1, d2, [formacion_team_id] if formacion_team_id else [])
-    cursos_year = won_year_formacion.shape[0] if not won_year_formacion.empty else 0
-
-    render_linea_tab("Formación", "Cursos entregados en el año", cursos_year)
-
-    st.divider()
-    st.markdown("#### 📈 Cursos vendidos (últimos 12 meses) y proyección (próximos 6, provisional)")
-    st.caption("La proyección es un promedio móvil simple de los últimos 3 meses — placeholder hasta "
-               "definir la fuente real de proyecciones de cursos con Paula (pendiente de la reunión).")
-    won_12m_formacion = load_won(desde_12m, hoy_iso, [formacion_team_id] if formacion_team_id else [])
-    if won_12m_formacion.empty:
-        st.info("No hay cursos (oportunidades ganadas) vendidos en los últimos 12 meses.")
+    proj_form = filtro_linea(projects, "Formación") if projects is not None else pd.DataFrame()
+    won_form = filtro_linea(won_all, "Formación")
+    if not proj_form.empty:
+        cursos_entregados = int(len(proj_form))
+        extra_label = "Cursos entregados en el año"
+        extra_val = cursos_entregados
+        st.caption(
+            "Entregados = proyectos `service_line=training` con fecha de fin/inicio en el año. "
+            "El campo dedicado de fecha de entrega de capacitaciones aún no existe (JUAN Z)."
+        )
     else:
-        cursos_mes = won_12m_formacion.groupby("mes", as_index=False).agg(cursos=("name", "count"))
-        proy = naive_projection(cursos_mes, "cursos", months_fwd=6, window=3)
-        cursos_mes["tipo"] = "Histórico"
-        proy["tipo"] = "Proyección (provisional)"
-        combinado = pd.concat([cursos_mes, proy], ignore_index=True)
-        fig = px.bar(combinado, x="mes", y="cursos", color="tipo",
-                     title="Cursos vendidos por mes — histórico y proyección",
+        extra_label = "Cursos vendidos en el año (CRM)"
+        extra_val = int(len(won_form))
+        if err_proj:
+            st.info(err_proj)
+
+    render_linea_comun("Formación", extra_label, extra_val)
+    chart_vendidos_y_proyeccion("Formación", "Cursos", "cursos")
+
+    if not proj_form.empty:
+        st.markdown("#### 🎓 Cursos / proyectos de Formación (entrega proxy)")
+        form_mes = proj_form.groupby("mes", as_index=False).agg(cursos=("name", "count"))
+        fig = px.bar(form_mes, x="mes", y="cursos", text_auto=True,
+                     title="Proyectos de Formación por mes de entrega (proxy)",
                      labels={"cursos": "Cursos", "mes": "Mes"})
         st.plotly_chart(fig, use_container_width=True)
+        with st.expander("Detalle de proyectos Formación"):
+            cols_p = [c for c in ["name", "cliente", "responsable", "fecha_entrega", "metodologia_progress"]
+                      if c in proj_form.columns]
+            st.dataframe(proj_form[cols_p], use_container_width=True, hide_index=True)
+
+    chart_rentabilidad_contable("Formación")
 
 
 # --- Fábrica de Software --------------------------------------------------
 with tab_fabrica:
-    fabrica_team_id = team_id_for_linea(teams_df, "Fábrica de Software")
-    won_year_fabrica = load_won(d1, d2, [fabrica_team_id] if fabrica_team_id else [])
-    proyectos_year = won_year_fabrica.shape[0] if not won_year_fabrica.empty else 0
-
-    render_linea_tab("Fábrica de Software", "Proyectos acumulados del año", proyectos_year)
-
-    st.divider()
-    st.markdown("#### 📈 Proyectos vendidos (últimos 12 meses) y proyección (próximos 6, provisional)")
-    st.caption("Igual que en Formación: proyección = promedio móvil simple, placeholder hasta definir "
-               "la fuente real de proyecciones.")
-    won_12m_fabrica = load_won(desde_12m, hoy_iso, [fabrica_team_id] if fabrica_team_id else [])
-    if won_12m_fabrica.empty:
-        st.info("No hay proyectos (oportunidades ganadas) vendidos en los últimos 12 meses.")
+    proj_fab = filtro_linea(projects, "Fábrica de Software") if projects is not None else pd.DataFrame()
+    won_fab = filtro_linea(won_all, "Fábrica de Software")
+    if not proj_fab.empty:
+        extra_label = "Proyectos acumulados del año"
+        extra_val = int(len(proj_fab))
     else:
-        proyectos_mes = won_12m_fabrica.groupby("mes", as_index=False).agg(proyectos=("name", "count"))
-        proy = naive_projection(proyectos_mes, "proyectos", months_fwd=6, window=3)
-        proyectos_mes["tipo"] = "Histórico"
-        proy["tipo"] = "Proyección (provisional)"
-        combinado = pd.concat([proyectos_mes, proy], ignore_index=True)
-        fig = px.bar(combinado, x="mes", y="proyectos", color="tipo",
-                     title="Proyectos vendidos por mes — histórico y proyección",
+        extra_label = "Proyectos vendidos en el año (CRM)"
+        extra_val = int(len(won_fab))
+
+    render_linea_comun("Fábrica de Software", extra_label, extra_val)
+    chart_vendidos_y_proyeccion("Fábrica de Software", "Proyectos", "proyectos")
+
+    if not proj_fab.empty:
+        st.markdown("#### 💻 Proyectos de Fábrica (entrega / fin de proyecto)")
+        fab_mes = proj_fab.groupby("mes", as_index=False).agg(proyectos=("name", "count"))
+        fig = px.bar(fab_mes, x="mes", y="proyectos", text_auto=True,
+                     title="Proyectos de Fábrica por mes",
                      labels={"proyectos": "Proyectos", "mes": "Mes"})
         st.plotly_chart(fig, use_container_width=True)
+        with st.expander("Detalle de proyectos Fábrica"):
+            cols_p = [c for c in ["name", "cliente", "responsable", "fecha_entrega", "metodologia_progress"]
+                      if c in proj_fab.columns]
+            st.dataframe(proj_fab[cols_p], use_container_width=True, hide_index=True)
+
+    chart_rentabilidad_contable("Fábrica de Software")
 
 
-# --- Equipo (horas y actividades) -----------------------------------------
+# --- Equipo ---------------------------------------------------------------
 with tab_equipo:
-    team_ids_equipo = [tid for tid in (team_id_for_linea(teams_df, l) for l in LINEA_TEAM) if tid]
-
     st.markdown("#### ⏱️ Horas del equipo por persona, mes y línea")
     horas_df, err_horas = load_analytic_hours(d1, d2)
     if err_horas:
         st.warning(err_horas)
     elif horas_df.empty:
-        st.info("No hay horas registradas (account.analytic.line) en el año seleccionado.")
+        st.info("No hay horas registradas (account.analytic.line) en el año.")
     else:
         col1, col2 = st.columns(2)
         with col1:
@@ -876,37 +755,104 @@ with tab_equipo:
                          title="Horas totales por persona (año)", text_auto=".1f",
                          labels={"unit_amount": "Horas", "persona": ""})
             st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("##### Detalle: horas por persona, mes y línea")
-        pivot_horas = horas_df.pivot_table(index="persona", columns=["linea", "mes"], values="unit_amount",
-                                            aggfunc="sum", fill_value=0)
-        with st.expander("📋 Ver tabla completa"):
+        with st.expander("Horas por persona, mes y línea"):
+            pivot_horas = horas_df.pivot_table(
+                index="persona", columns=["linea", "mes"],
+                values="unit_amount", aggfunc="sum", fill_value=0,
+            )
             st.dataframe(pivot_horas, use_container_width=True)
 
     st.divider()
-    st.markdown("#### 🏗️ Top 5 proyectos por horas — vendedores de Staff / Formación / Fábrica (histórico mensual)")
-    st.caption("Por PROYECTO (project.project), no por tarea — solo horas de quienes son miembros de "
-               "los 3 equipos de venta. Para ver mes a mes en qué se les va el tiempo y cómo cambia esa "
-               "asignación (ej. si un vendedor se corre de 'Gestión comercial' hacia otra cosa).")
+    st.markdown("#### ✅ Actividades del equipo por línea y mes (histórico real)")
+    st.caption(
+        "Fuente: `crm.activity.report` (mensajes de chatter con tipo de actividad). "
+        "Mide presentación de negocio, propuesta, socialización y seguimiento — "
+        "y el resto de tipos que existan en Odoo."
+    )
+    act_hist, err_act_h = load_activity_report(d1, d2, team_ids)
+    if err_act_h:
+        st.warning(err_act_h)
+    elif act_hist.empty:
+        st.info("No hay actividades completadas en `crm.activity.report` este año. Paula: registrar actividades en el CRM.")
+    else:
+        comercial = act_hist[act_hist["tipo"].map(es_tipo_comercial)]
+        usar = comercial if not comercial.empty else act_hist
+        if comercial.empty:
+            st.caption("No coincidió ningún tipo con presentación/propuesta/socialización/seguimiento. Se muestran todos.")
+        col3, col4 = st.columns(2)
+        with col3:
+            por_linea = usar.groupby(["mes", "linea"], as_index=False).agg(cantidad=("lead_id", "count"))
+            fig = px.bar(por_linea, x="mes", y="cantidad", color="linea", barmode="group",
+                         title="Actividades completadas por línea y mes",
+                         labels={"cantidad": "Actividades", "mes": "Mes"})
+            st.plotly_chart(fig, use_container_width=True)
+        with col4:
+            por_tipo = usar.groupby("tipo", as_index=False).agg(cantidad=("lead_id", "count"))
+            fig = px.bar(por_tipo.sort_values("cantidad"), x="cantidad", y="tipo", orientation="h",
+                         title="Actividades por tipo", text_auto=True,
+                         labels={"cantidad": "Actividades", "tipo": ""})
+            st.plotly_chart(fig, use_container_width=True)
+        with st.expander("Detalle de actividades completadas"):
+            st.dataframe(
+                usar[["mes", "tipo", "vendedor", "linea"]].sort_values(["mes", "linea"]),
+                use_container_width=True, hide_index=True,
+            )
 
-    vendedores_df = load_sales_team_employees(team_ids_equipo)
+    st.markdown("#### ⏳ Backlog de actividades pendientes (foto de hoy)")
+    st.caption("Odoo borra `mail.activity` al completarlas. Esto es solo lo que sigue abierto.")
+    actividades, err_act = load_team_activities(team_ids)
+    if err_act:
+        st.warning(err_act)
+    elif actividades.empty:
+        st.info("No hay actividades pendientes sobre oportunidades.")
+    else:
+        por_linea_mes = actividades.groupby(["mes", "equipo"], as_index=False).agg(cantidad=("res_id", "count"))
+        fig = px.bar(por_linea_mes, x="mes", y="cantidad", color="equipo", barmode="group",
+                     title="Pendientes por línea y mes de vencimiento",
+                     labels={"cantidad": "Actividades", "mes": "Mes"})
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.markdown("#### 🕑 Horas dedicadas a cada actividad (reuniones de calendario)")
+    st.caption(
+        "`mail.activity` no guarda duración. Proxy: `calendar.event.duration` de reuniones "
+        "ligadas a una oportunidad del equipo. El nombre de la reunión se usa como tipo "
+        "(ej. 'Propuesta X')."
+    )
+    cal, err_cal = load_calendar_hours(d1, d2, team_ids)
+    if err_cal:
+        st.warning(err_cal)
+    elif cal.empty:
+        st.info("No hay reuniones de calendario ligadas a oportunidades de estas líneas.")
+    else:
+        cal["tipo_corto"] = cal["tipo"].str.slice(0, 40)
+        por_persona = (cal.groupby(["persona", "linea", "mes"], as_index=False)["duration"].sum())
+        fig = px.bar(por_persona, x="mes", y="duration", color="persona", facet_col="linea",
+                     title="Horas de reunión por persona, mes y línea",
+                     labels={"duration": "Horas", "mes": "Mes"})
+        st.plotly_chart(fig, use_container_width=True)
+        with st.expander("Horas por persona y nombre de reunión"):
+            det = (cal.groupby(["persona", "linea", "tipo_corto"], as_index=False)["duration"]
+                   .sum().sort_values("duration", ascending=False))
+            st.dataframe(det, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("#### 🏗️ Top 5 proyectos por horas — vendedores de las 3 líneas")
+    vendedores_df = load_sales_team_employees(team_ids)
     if vendedores_df.empty:
-        st.info("No encontré vendedores (miembros de los equipos Staff/Formación/Fábrica en crm.team) "
-                "para cruzar con las horas registradas.")
+        st.info("No hay miembros en los equipos de venta para cruzar con timesheets.")
     else:
         horas_proy_df, err_proy = load_hours_by_project(d1, d2, vendedores_df["employee_id"].tolist())
         if err_proy:
             st.warning(err_proy)
         elif horas_proy_df.empty:
-            st.info("No hay horas por proyecto registradas para estos vendedores en el año seleccionado.")
+            st.info("No hay horas por proyecto para estos vendedores.")
         else:
             resumen_proy = (horas_proy_df.groupby("proyecto", as_index=False)["unit_amount"].sum()
                             .sort_values("unit_amount", ascending=False))
-            total_horas_proy = resumen_proy["unit_amount"].sum()
-            resumen_proy["pct"] = resumen_proy["unit_amount"] / total_horas_proy * 100 if total_horas_proy else 0
-            top5_proyectos = resumen_proy.head(5)["proyecto"].tolist()
-
-            st.markdown("##### Todos los proyectos — horas y % del total (año seleccionado)")
+            total = resumen_proy["unit_amount"].sum()
+            resumen_proy["pct"] = resumen_proy["unit_amount"] / total * 100 if total else 0
+            top5 = resumen_proy.head(5)["proyecto"].tolist()
             st.dataframe(
                 resumen_proy, use_container_width=True, hide_index=True,
                 column_config={
@@ -915,83 +861,31 @@ with tab_equipo:
                     "pct": st.column_config.NumberColumn("%", format="%.2f%%"),
                 },
             )
-
-            top5_df = horas_proy_df[horas_proy_df["proyecto"].isin(top5_proyectos)]
+            top5_df = horas_proy_df[horas_proy_df["proyecto"].isin(top5)]
             mensual_top5 = top5_df.groupby(["mes", "proyecto"], as_index=False)["unit_amount"].sum()
             fig = px.line(mensual_top5, x="mes", y="unit_amount", color="proyecto", markers=True,
-                         title="Top 5 proyectos — horas por mes (histórico)",
-                         labels={"unit_amount": "Horas", "mes": "Mes"})
+                          title="Top 5 proyectos — horas por mes",
+                          labels={"unit_amount": "Horas", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
-            st.markdown("##### Asignación mensual por vendedor, dentro del Top 5 de proyectos")
-            pivot_vend_proy = top5_df.pivot_table(index="vendedor", columns=["mes", "proyecto"],
-                                                   values="unit_amount", aggfunc="sum", fill_value=0)
-            with st.expander("📋 Ver detalle por vendedor, mes y proyecto"):
-                st.dataframe(pivot_vend_proy, use_container_width=True)
 
-    st.divider()
-    st.markdown("#### 👥 Actividades del equipo por línea y mes (backlog actual)")
-    st.caption("⚠️ Odoo elimina `mail.activity` al marcarla como hecha (queda como mensaje en el "
-               "chatter, no como registro consultable por mes). Esto es una **foto del backlog "
-               "pendiente hoy**, agrupado por mes de vencimiento — no un histórico de actividades "
-               "ya completadas. Tampoco trae horas: `mail.activity` no registra duración en Odoo "
-               "estándar, así que \"horas dedicadas a cada actividad\" no se puede sacar de aquí — "
-               "necesitaría un registro dedicado (ej. timesheet por tipo de actividad).")
-
-    actividades, err_act = load_team_activities(team_ids_equipo)
-    if err_act:
-        st.warning(err_act)
-    elif actividades.empty:
-        st.info("No hay actividades pendientes sobre oportunidades en este momento.")
-    else:
-        col3, col4 = st.columns(2)
-        with col3:
-            por_linea_mes = actividades.groupby(["mes", "equipo"], as_index=False).agg(cantidad=("res_id", "count"))
-            fig = px.bar(por_linea_mes, x="mes", y="cantidad", color="equipo", barmode="group",
-                         title="Actividades pendientes por línea y mes de vencimiento",
-                         labels={"cantidad": "Actividades", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True)
-        with col4:
-            por_tipo = actividades.groupby("tipo", as_index=False).agg(cantidad=("res_id", "count"))
-            fig = px.bar(por_tipo.sort_values("cantidad"), x="cantidad", y="tipo", orientation="h",
-                         title="Actividades pendientes por tipo", text_auto=True,
-                         labels={"cantidad": "Actividades", "tipo": ""})
-            st.plotly_chart(fig, use_container_width=True)
-        with st.expander("📋 Detalle de actividades pendientes"):
-            st.dataframe(
-                actividades[["tipo", "vendedor", "equipo", "date_deadline", "create_date"]].sort_values("date_deadline"),
-                use_container_width=True, hide_index=True,
-            )
-
-
-# --- Vendedores -------------------------------------------------------
+# --- Vendedores -----------------------------------------------------------
 with tab_vendedor:
-    st.caption("Cierres/nuevos negocios y facturación por vendedor, mes y línea — año seleccionado en la barra lateral.")
+    st.caption("Cierres (CRM ganadas) y facturación por vendedor, mes y línea.")
+    won_vend = won_all[won_all["linea"] != "Sin línea"] if not won_all.empty else won_all
+    fact_vend = invoices_all[invoices_all["linea"] != "Sin línea"] if not invoices_all.empty else invoices_all
+    sales_vend = sales_all[sales_all["linea"] != "Sin línea"] if not sales_all.empty else sales_all
 
-    won_vend_all = []
-    fact_vend_all = []
-    for linea in LINEA_TEAM:
-        tid = team_id_for_linea(teams_df, linea)
-        ids = [tid] if tid else []
-        w = load_won(d1, d2, ids)
-        if not w.empty:
-            won_vend_all.append(w.assign(linea=linea))
-        f = load_invoices(d1, d2, ids)
-        if not f.empty:
-            fact_vend_all.append(f.assign(linea=linea))
-
-    won_vend = pd.concat(won_vend_all, ignore_index=True) if won_vend_all else pd.DataFrame(columns=["mes", "linea", "vendedor", "name", "expected_revenue"])
-    fact_vend = pd.concat(fact_vend_all, ignore_index=True) if fact_vend_all else pd.DataFrame(columns=["mes", "linea", "vendedor", "amount_total_signed"])
-
-    st.markdown("#### 🏆 Número de cierres (nuevos negocios) por vendedor, mes y línea")
+    st.markdown("#### 🏆 Cierres (nuevos negocios) por vendedor, mes y línea")
     if won_vend.empty:
         st.info("No hay oportunidades ganadas en el período.")
     else:
         cierres = won_vend.groupby(["mes", "vendedor", "linea"], as_index=False).agg(cierres=("name", "count"))
         fig = px.bar(cierres, x="mes", y="cierres", color="vendedor", barmode="group", facet_col="linea",
-                     title="Cierres por vendedor, mes y línea", labels={"cierres": "Cierres", "mes": "Mes"})
+                     title="Cierres por vendedor, mes y línea",
+                     labels={"cierres": "Cierres", "mes": "Mes"})
         st.plotly_chart(fig, use_container_width=True)
-        with st.expander("📋 Detalle de cierres"):
+        with st.expander("Detalle de cierres"):
             st.dataframe(cierres.sort_values(["linea", "mes"]), use_container_width=True, hide_index=True)
 
     st.markdown("#### 🧾 Facturación por vendedor, mes y línea")
@@ -1003,8 +897,37 @@ with tab_vendedor:
                      title="Facturación por vendedor, mes y línea",
                      labels={"amount_total_signed": "COP", "mes": "Mes"})
         st.plotly_chart(fig, use_container_width=True)
-        with st.expander("📋 Detalle de facturación"):
+        with st.expander("Detalle de facturación"):
             st.dataframe(
                 fact_v.sort_values(["linea", "mes"]), use_container_width=True, hide_index=True,
                 column_config={"amount_total_signed": st.column_config.NumberColumn("Facturado", format="$%,.0f")},
             )
+
+    st.markdown("#### 📦 Órdenes confirmadas por vendedor, mes y línea")
+    if sales_vend.empty:
+        st.info("No hay órdenes confirmadas en el período.")
+    else:
+        ov = sales_vend.groupby(["mes", "vendedor", "linea"], as_index=False).agg(
+            ordenes=("name", "count"), vendido=("amount_total", "sum")
+        )
+        fig = px.bar(ov, x="mes", y="ordenes", color="vendedor", barmode="group", facet_col="linea",
+                     title="Nº de OV confirmadas por vendedor",
+                     labels={"ordenes": "Órdenes", "mes": "Mes"})
+        st.plotly_chart(fig, use_container_width=True)
+
+
+with st.sidebar.expander("Fuentes Odoo y pendientes"):
+    st.markdown(
+        """
+- **Plazas** → `firefly.staffing.request` (fallback: suscripciones)
+- **Renovaciones** → `firefly.staffing.history` (fallback: `sale.order.log`)
+- **Vendido** → `sale.order` confirmadas, clasificadas por equipo / `service_line` / staff
+- **Facturas** → `account.move` + facturas ligadas a esas OV
+- **Leads / origen** → `crm.lead` + `source_id` (equipo CRM)
+- **Cursos/proyectos entregados** → `project.project.service_line` (fecha fin = proxy)
+- **Actividades hechas** → `crm.activity.report`
+- **Horas por actividad** → `calendar.event.duration` (proxy)
+- **Pendiente JUAN Z:** campo de fecha de entrega de capacitaciones
+- **Pendiente PAULA / Raquel:** costo fijo Diego y Paula ≠ 0; equipos en facturas/OV Staff; `date_deadline` en pipeline
+        """
+    )
