@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
-_DATA_VERSION = 15
+_DATA_VERSION = 16
 
 
 def allowed_team_ids() -> set[int]:
@@ -1304,17 +1304,17 @@ def staffing_recurrente_monthly(requests: pd.DataFrame, months: list[str]) -> pd
 
 def staff_recurrente_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | None,
                              months: list[str], team_id: int | None = None) -> pd.DataFrame:
-    """KPI anual Staff: valor suscripción × plan recurrente (periodos vigentes del año).
+    """KPI anual Staff: valor × plan recurrente (periodos vigentes del año).
 
-    Prioriza suscripciones Odoo (Recurrente × meses si el plan es mensual).
-    Si no hay suscripciones, usa solicitudes Staff.
+    Prioriza `firefly.staffing.request` (valor mensual × meses vigentes ≈ los ~333M).
+    Las suscripciones solas pueden inflar (renovaciones / cadenas); solo fallback.
     """
-    if subs is not None and not subs.empty:
-        out = subscription_recurrente_monthly(subs, months, team_id=team_id)
+    if requests is not None and not requests.empty:
+        out = staffing_recurrente_monthly(requests, months)
         if not out.empty and float(out["vendido"].sum()) > 0:
             return out
-    return staffing_recurrente_monthly(
-        requests if requests is not None else pd.DataFrame(), months
+    return subscription_recurrente_monthly(
+        subs if subs is not None else pd.DataFrame(), months, team_id=team_id
     )
 
 

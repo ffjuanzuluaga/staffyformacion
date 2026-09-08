@@ -513,10 +513,10 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     if linea == "Staff":
         st.caption(
             f"Todos los pesos son **antes de impuestos**. "
-            f"**Vendido Staff (KPI de arriba)** = valor de la suscripción × plan recurrente "
-            f"(columna **Recurrente** × cada mes vigente; plan mensual → × meses del año). "
-            f"Fuente: `{staff_vendido_fuente}`. Hoy: {fmt_money(staff_vendido_anual)}. "
-            f"**Cierre del año** (solo contratos nuevos por Fecha del primer contrato): "
+            f"**Vendido Staff (KPI de arriba)** = valor mensual de la plaza × meses vigentes "
+            f"(equivalente a suscripción × plan mensual; fuente: `{staff_vendido_fuente}`). "
+            f"Hoy: {fmt_money(staff_vendido_anual)}. "
+            f"**Cierre del año** (contratos nuevos por Fecha del primer contrato): "
             f"{fmt_money(staff_cierre_anual)} (`{staff_cierre_fuente}`). "
             f"El gráfico de abajo es el **cierre mes a mes** (p. ej. agosto = 14M). "
             f"**Facturado** = líneas de asiento `display_type=product` (−`balance` COP)."
