@@ -67,8 +67,8 @@ OTHER_TEAMS_NORM = {
 }
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
-# Bust de caché Streamlit cuando cambia la lógica de clasificación.
-_DATA_VERSION = 11
+# Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
+_DATA_VERSION = 12
 
 
 def allowed_team_ids() -> set[int]:
@@ -1006,8 +1006,8 @@ def load_staffing_renewals(date_from: str, date_to: str):
 def load_subscriptions(team_id: int | None):
     wanted = [
         "name", "partner_id", "subscription_state", "start_date", "end_date",
-        "team_id", "next_invoice_date", "recurring_monthly", "staff_request_id",
-        "user_id", "amount_untaxed",
+        "first_contract_date", "team_id", "next_invoice_date", "recurring_monthly",
+        "staff_request_id", "user_id", "amount_untaxed", "currency_id", "currency_rate",
     ]
     have = available_fields("sale.order")
     domain = []
@@ -1037,9 +1037,27 @@ def load_subscriptions(team_id: int | None):
     df["cliente"] = m2o_name(df["partner_id"])
     df["start_date"] = pd.to_datetime(df["start_date"], errors="coerce")
     df["end_date"] = pd.to_datetime(df["end_date"], errors="coerce")
+    if "first_contract_date" in df.columns:
+        df["first_contract_date"] = pd.to_datetime(df["first_contract_date"], errors="coerce")
+    else:
+        df["first_contract_date"] = df["start_date"]
     if "next_invoice_date" in df:
         df["next_invoice_date"] = pd.to_datetime(df["next_invoice_date"], errors="coerce")
     df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
+    df["moneda"] = m2o_name(df["currency_id"]) if "currency_id" in df else "COP"
+
+    # Recurrente (MRR) en moneda compañía — misma convención que OV: amount / currency_rate.
+    mrr = pd.to_numeric(df.get("recurring_monthly", df.get("amount_untaxed", 0)), errors="coerce").fillna(0.0)
+    if "recurring_monthly" not in df.columns:
+        df["recurring_monthly"] = mrr
+    rate = pd.to_numeric(df["currency_rate"], errors="coerce") if "currency_rate" in df else pd.Series(1.0, index=df.index)
+    rate = rate.replace(0, pd.NA).fillna(1.0)
+    company_cur = company_currency_id()
+    cur_ids = m2o_id(df["currency_id"]) if "currency_id" in df else pd.Series([None] * len(df), index=df.index)
+    same_cur = cur_ids.isna() | (cur_ids.astype("Int64") == company_cur) if company_cur else cur_ids.isna()
+    foreign_without_rate = (~same_cur) & (rate.sub(1.0).abs() < 1e-12)
+    df["recurring_monthly_company"] = mrr.where(same_cur | foreign_without_rate, mrr / rate)
+    df.loc[foreign_without_rate, "recurring_monthly_company"] = mrr.loc[foreign_without_rate]
     return df, None
 
 
@@ -1121,61 +1139,85 @@ def staffing_pnl_monthly(requests: pd.DataFrame, months: list[str],
     return pd.DataFrame(rows)
 
 
-# Borradores / renovación en curso no cuentan como vendido recurrente.
-SUB_VENDIDO_SKIP_STATES = ("1_draft", "2_renewal")
+# Borradores / renovación en curso / upsells no son "cierre" de plaza nueva.
+# Igual que en Suscripciones Odoo agrupado por Fecha del primer contrato.
+SUB_VENDIDO_SKIP_STATES = ("1_draft", "2_renewal", "7_upsell")
 
 
-def staffing_vendido_monthly(requests: pd.DataFrame, months: list[str]) -> pd.DataFrame:
-    """Vendido Staff = MRR en moneda compañía × meses de vigencia en el período.
+def subscription_cierre_monthly(subs: pd.DataFrame, months: list[str]) -> pd.DataFrame:
+    """Vendido Staff = Σ Recurrente (MRR) de suscripciones con first_contract_date en el mes.
 
-    Las OV de suscripción guardan solo un período (`amount_untaxed` ≈ fee mensual).
-    La meta anual de Staff es ingreso recurrente, no el importe de una sola OV.
+    Misma lectura que Odoo: Suscripciones → agrupar por Fecha del primer contrato.
+    No suma plazas ya vigentes de meses anteriores (eso es ingreso operativo, no cierre).
     """
+    fuente = "sale.order · first_contract_date + recurring_monthly"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
-    if requests is None or requests.empty:
-        return pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
-                             "fuente": ["firefly.staffing.request"] * len(months)})
-    pnl = staffing_pnl_monthly(requests, months, 0.0)
-    return pd.DataFrame({
-        "mes": pnl["mes"],
-        "vendido": pnl["ingreso_plazas"].astype(float),
-        "fuente": "firefly.staffing.request",
-    })
-
-
-def subscription_vendido_monthly(subs: pd.DataFrame, months: list[str]) -> pd.DataFrame:
-    """Fallback: MRR de suscripciones (`recurring_monthly` o amount_untaxed) por mes de cobertura."""
-    if not months:
-        return pd.DataFrame(columns=["mes", "vendido", "fuente"])
+    empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
+                          "fuente": [fuente] * len(months)})
     if subs is None or subs.empty:
-        return pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
-                             "fuente": ["sale.order suscripción"] * len(months)})
-    sub = subs
-    if "subscription_state" in subs.columns:
-        sub = subs[~subs["subscription_state"].isin(SUB_VENDIDO_SKIP_STATES)].copy()
-    amount_col = "recurring_monthly" if "recurring_monthly" in sub.columns else "amount_untaxed"
-    if amount_col not in sub.columns:
-        return pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
-                             "fuente": ["sale.order suscripción"] * len(months)})
-    amounts = pd.to_numeric(sub[amount_col], errors="coerce").fillna(0.0)
-    rows = []
-    for mes in months:
-        mask = coverage_mask(sub, "start_date", "end_date", mes)
-        rows.append({
-            "mes": mes,
-            "vendido": float(amounts[mask].sum()),
-            "fuente": "sale.order suscripción",
-        })
-    return pd.DataFrame(rows)
+        return empty
+
+    sub = subs.copy()
+    if "subscription_state" in sub.columns:
+        sub = sub[~sub["subscription_state"].isin(SUB_VENDIDO_SKIP_STATES)]
+    if sub.empty:
+        return empty
+
+    date_col = "first_contract_date" if "first_contract_date" in sub.columns else "start_date"
+    sub["_cierre"] = pd.to_datetime(sub[date_col], errors="coerce")
+    sub = sub[sub["_cierre"].notna()].copy()
+    if sub.empty:
+        return empty
+    sub["mes"] = sub["_cierre"].dt.to_period("M").astype(str)
+
+    amount_col = (
+        "recurring_monthly_company" if "recurring_monthly_company" in sub.columns
+        else "recurring_monthly" if "recurring_monthly" in sub.columns
+        else "amount_untaxed"
+    )
+    sub["_mrr"] = pd.to_numeric(sub[amount_col], errors="coerce").fillna(0.0)
+    por_mes = sub.groupby("mes", as_index=False)["_mrr"].sum().rename(columns={"_mrr": "vendido"})
+    out = pd.DataFrame({"mes": months}).merge(por_mes, on="mes", how="left")
+    out["vendido"] = out["vendido"].fillna(0.0)
+    out["fuente"] = fuente
+    return out
+
+
+def staffing_cierre_monthly(requests: pd.DataFrame, months: list[str]) -> pd.DataFrame:
+    """Fallback sin suscripciones: MRR de plazas cuyo date_start cae en el mes."""
+    fuente = "firefly.staffing.request · date_start"
+    if not months:
+        return pd.DataFrame(columns=["mes", "vendido", "fuente"])
+    empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
+                          "fuente": [fuente] * len(months)})
+    if requests is None or requests.empty:
+        return empty
+    usable = requests[requests["state"].isin(STAFF_COVERAGE_STATES)].copy() if "state" in requests.columns else requests.copy()
+    if usable.empty or "date_start" not in usable.columns:
+        return empty
+    usable = usable[usable["date_start"].notna()].copy()
+    if usable.empty:
+        return empty
+    usable["mes"] = usable["date_start"].dt.to_period("M").astype(str)
+    usable["_mrr"] = pd.to_numeric(
+        usable.get("monthly_amount_company_currency", 0), errors="coerce"
+    ).fillna(0.0)
+    por_mes = usable.groupby("mes", as_index=False)["_mrr"].sum().rename(columns={"_mrr": "vendido"})
+    out = pd.DataFrame({"mes": months}).merge(por_mes, on="mes", how="left")
+    out["vendido"] = out["vendido"].fillna(0.0)
+    out["fuente"] = fuente
+    return out
 
 
 def staff_vendido_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | None,
                           months: list[str]) -> pd.DataFrame:
-    """Serie mensual de vendido Staff: solicitudes primero, suscripciones si no hay."""
-    if requests is not None and not requests.empty:
-        return staffing_vendido_monthly(requests, months)
-    return subscription_vendido_monthly(subs if subs is not None else pd.DataFrame(), months)
+    """Cierre de venta Staff: suscripciones por first_contract_date; si no hay, solicitudes."""
+    if subs is not None and not subs.empty:
+        return subscription_cierre_monthly(subs, months)
+    return staffing_cierre_monthly(
+        requests if requests is not None else pd.DataFrame(), months
+    )
 
 
 # ─────────────────────────────────────────────

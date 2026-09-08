@@ -57,8 +57,8 @@ st.set_page_config(
 
 
 # Vendido (Formación / Fábrica) = amount_untaxed_company (COP, OV + TRM).
-# Vendido (Staff) = MRR recurrente × meses de vigencia (suscripciones), no el
-# amount_untaxed de una sola OV (que solo refleja un período de facturación).
+# Vendido (Staff) = Σ Recurrente (MRR) de suscripciones con Fecha del primer
+# contrato en el mes — igual que Odoo Suscripciones agrupado por first_contract_date.
 # Facturado = amount_untaxed_signed → base imponible en COP compañía
 # (Odoo ya convierte USD→COP al contabilizar). NC restan.
 # amount_untaxed_in_currency_signed se muestra solo en debug (moneda documento).
@@ -350,7 +350,7 @@ def chart_venta_vs_meta(linea: str, sales: pd.DataFrame):
     meta_m = meta_anual_de(metas_lineas, linea) / 12
     if linea == "Staff":
         scol = STAFF_VENDIDO_COL
-        titulo = f"{linea} — vendido recurrente (MRR×plazas) vs. meta mensual ({anio})"
+        titulo = f"{linea} — cierre MRR (Fecha primer contrato) vs. meta mensual ({anio})"
         ventas_mes = (
             sales.groupby("mes", as_index=False)[scol].sum()
             if sales is not None and not sales.empty and scol in sales
@@ -494,9 +494,11 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     if linea == "Staff":
         st.caption(
             f"Todos los pesos son **antes de impuestos**. "
-            f"**Vendido Staff** = valor mensual de plazas vigentes × meses del año "
-            f"(fuente: `{staff_vendido_fuente}`). Las OV de suscripción solo traen "
-            f"un período (`amount_untaxed` ≈ fee mensual); no se usan para la meta. "
+            f"**Vendido Staff** = Σ **Recurrente** (MRR) de suscripciones cuya "
+            f"**Fecha del primer contrato** cae en el mes "
+            f"(fuente: `{staff_vendido_fuente}`). "
+            f"Igual que Odoo → Suscripciones agrupado por ese campo. "
+            f"No suma plazas ya vigentes de meses anteriores. "
             f"**Facturado** = líneas de asiento `display_type=product` "
             f"(−`balance` en COP compañía). Equipo = team_id del asiento."
         )
@@ -514,17 +516,39 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     chart_fact_y_leads(linea, k["invoices"], k["leads"])
     chart_leads_origen(linea, k["leads"])
     if linea == "Staff":
-        with st.expander("Detalle vendido recurrente Staff (mes a mes)"):
+        with st.expander("Detalle cierre Staff (suscripciones por Fecha del primer contrato)"):
             st.dataframe(
                 staff_vendido_mes,
                 use_container_width=True, hide_index=True,
                 column_config={
                     "mes": "Mes",
-                    "vendido": st.column_config.NumberColumn("Vendido (MRR plazas)", format="$%,.0f"),
+                    "vendido": st.column_config.NumberColumn("MRR cerrado", format="$%,.0f"),
                     "fuente": "Fuente",
                 },
             )
-        with st.expander("Detalle OV Staff (referencia: 1 período, no suman a meta)"):
+            if subs_df is not None and not subs_df.empty and "first_contract_date" in subs_df.columns:
+                det = subs_df.copy()
+                if "subscription_state" in det.columns:
+                    det = det[~det["subscription_state"].isin(["1_draft", "2_renewal", "7_upsell"])]
+                det = det[det["first_contract_date"].notna()].copy()
+                det["mes"] = det["first_contract_date"].dt.to_period("M").astype(str)
+                det = det[det["mes"].isin(months_year)]
+                mrr_col = "recurring_monthly_company" if "recurring_monthly_company" in det.columns else "recurring_monthly"
+                cols = [c for c in [
+                    "name", "cliente", "first_contract_date", "mes", "subscription_state",
+                    "moneda", "recurring_monthly", mrr_col, "equipo",
+                ] if c in det.columns]
+                if cols:
+                    st.caption("Suscripciones que suman al cierre del año seleccionado:")
+                    st.dataframe(
+                        det[cols].sort_values("first_contract_date"),
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "recurring_monthly": st.column_config.NumberColumn("Recurrente", format="%,.0f"),
+                            mrr_col: st.column_config.NumberColumn("MRR COP", format="$%,.0f"),
+                        },
+                    )
+        with st.expander("Detalle OV Staff (referencia: amount_untaxed de 1 período)"):
             s = k.get("sales_ov")
             if s is None or s.empty:
                 st.caption("Sin órdenes confirmadas.")
@@ -625,8 +649,8 @@ with tab_resumen:
     )
     st.caption(
         f"Montos **antes de impuestos**. Para cuadrar en Odoo · "
-        f"**Vendido Staff:** valor mensual de plazas vigentes × meses "
-        f"(`{staff_vendido_fuente}`), no el importe de una sola OV de suscripción. "
+        f"**Vendido Staff:** Σ Recurrente (MRR) por **Fecha del primer contrato** "
+        f"(`{staff_vendido_fuente}`) — igual que Suscripciones en Odoo. "
         f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {anio} · "
         f"Confirmado · Importe sin impuestos. "
         f"**Facturado:** `account.move.line` publicadas · tipo **product** · "
@@ -761,7 +785,7 @@ with tab_resumen:
                          labels={FACT_COL: "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
     with col_b:
-        # Staff usa MRR recurrente; Formación/Fábrica usan OV por date_order.
+        # Staff usa cierre por first_contract_date; Formación/Fábrica usan OV.
         partes = []
         if not staff_vendido_mes.empty:
             staff_part = staff_vendido_mes[["mes", "vendido"]].copy()
@@ -776,7 +800,7 @@ with tab_resumen:
         if partes:
             mensual_v = pd.concat(partes, ignore_index=True)
             fig = px.bar(mensual_v, x="mes", y="monto", color="linea", barmode="group",
-                         title="Vendido s/imp. mes a mes por línea (Staff = recurrente)",
+                         title="Vendido s/imp. mes a mes por línea (Staff = cierre MRR)",
                          labels={"monto": "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
@@ -1148,8 +1172,8 @@ with tab_vendedor:
 
     st.markdown("#### 📦 Órdenes confirmadas por vendedor, mes y línea (s/imp.)")
     st.caption(
-        "Para Staff, el importe de la OV es **un período** de la suscripción (MRR), "
-        "no el vendido anual. El cumplimiento de meta Staff usa el valor recurrente de plazas."
+        "Para Staff, el cumplimiento de meta usa el **MRR (Recurrente)** de suscripciones "
+        "cerradas por **Fecha del primer contrato**, no el amount_untaxed de la OV ni las plazas vigentes."
     )
     scol = sales_amount_col(sales_vend)
     if sales_vend.empty or scol not in sales_vend.columns:
@@ -1169,7 +1193,7 @@ with st.sidebar.expander("Fuentes Odoo y pendientes"):
         """
 - **Plazas** → `firefly.staffing.request` (fallback: suscripciones)
 - **Renovaciones** → `firefly.staffing.history` (fallback: `sale.order.log`)
-- **Vendido Staff** → MRR de plazas × meses de vigencia (suscripciones recurrentes)
+- **Vendido Staff** → Σ Recurrente (MRR) por Fecha del primer contrato (suscripciones)
 - **Vendido Formación/Fábrica** → OV confirmadas por `date_order`, s/imp. en COP
 - **Facturado** → `account.move.line` tipo product, −`balance` (COP compañía)
 - **Leads / origen** → `crm.lead` + `source_id` (equipo CRM)

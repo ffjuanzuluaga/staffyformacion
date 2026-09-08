@@ -49,7 +49,7 @@ Cuentas analíticas: `Staffing IT`, `Formación TI`, `Fábrica Software`.
 | Plazas activas y proyección | `firefly.staffing.request` (`date_start`/`date_end`, estado confirmado). Fallback: `sale.order` con `is_subscription` |
 | Renovaciones del mes | `firefly.staffing.history` (`event_type=renewal`). Fallback: `sale.order.log` transferencias |
 | Rentabilidad Staff (recurso) | Valor mensual a cobrar − valor a pagar al proveedor − fijo de Diego |
-| Vendido Staff | `firefly.staffing.request`: `monthly_amount_company_currency` × meses de vigencia en el año (suscripción recurrente). Fallback: `sale.order.recurring_monthly` |
+| Vendido Staff | Σ `recurring_monthly` de `sale.order` suscripciones con **`first_contract_date`** en el mes (igual que Odoo → Suscripciones). Fallback: `firefly.staffing.request.date_start` |
 | Vendido Formación / Fábrica | `sale.order` confirmadas por **`date_order`**, s/imp. en **COP** = `amount_untaxed / currency_rate`. Si la OV está en USD sin TRM (`currency_rate≈1`), se avisa y no se convierte |
 | Facturación | `account.move` posted por **`invoice_date`**, **antes de impuestos** (`amount_untaxed_signed`; NC restan). Cuadra con Base imponible / Importe sin impuestos |
 | Leads / origen | `crm.lead` + `source_id`, filtrado por equipo |
