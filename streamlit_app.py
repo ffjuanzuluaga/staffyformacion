@@ -42,6 +42,7 @@ from odoo_io import (
     load_won,
     month_list,
     resolve_linea_teams,
+    staff_cierre_detail,
     staff_vendido_monthly,
     staffing_coverage,
     staffing_pnl_monthly,
@@ -278,8 +279,8 @@ renewals, err_ren = load_staffing_renewals(d1, d2)
 sub_logs, err_logs = load_subscription_logs(d1, d2, team_ids)
 projects, err_proj = load_projects(d1, d2)
 
-# Staff: vendido = valor mensual recurrente × meses de cobertura (no OV única).
-staff_vendido_mes = staff_vendido_monthly(staff_req, subs_df, months_year)
+# Staff: vendido = cierre MRR por Fecha del primer contrato (como Suscripciones Odoo).
+staff_vendido_mes = staff_vendido_monthly(staff_req, subs_df, months_year, team_id=staff_team_id)
 staff_vendido_anual = float(staff_vendido_mes["vendido"].sum()) if not staff_vendido_mes.empty else 0.0
 staff_vendido_fuente = (
     str(staff_vendido_mes["fuente"].iloc[0]) if not staff_vendido_mes.empty else "suscripciones"
@@ -526,28 +527,30 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                     "fuente": "Fuente",
                 },
             )
-            if subs_df is not None and not subs_df.empty and "first_contract_date" in subs_df.columns:
-                det = subs_df.copy()
-                if "subscription_state" in det.columns:
-                    det = det[~det["subscription_state"].isin(["1_draft", "2_renewal", "7_upsell"])]
-                det = det[det["first_contract_date"].notna()].copy()
+            det = staff_cierre_detail(subs_df, team_id=staff_team_id)
+            if det is not None and not det.empty:
+                det = det.copy()
                 det["mes"] = det["first_contract_date"].dt.to_period("M").astype(str)
                 det = det[det["mes"].isin(months_year)]
-                mrr_col = "recurring_monthly_company" if "recurring_monthly_company" in det.columns else "recurring_monthly"
                 cols = [c for c in [
                     "name", "cliente", "first_contract_date", "mes", "subscription_state",
-                    "moneda", "recurring_monthly", mrr_col, "equipo",
+                    "moneda", "recurring_monthly", "equipo",
                 ] if c in det.columns]
                 if cols:
-                    st.caption("Suscripciones que suman al cierre del año seleccionado:")
+                    st.caption(
+                        "Mismo corte que Odoo Suscripciones: equipo Staffing IT, "
+                        "estados En progreso / Pausada / Caducada (sin Renovada ni borrador), "
+                        "una fila por contrato (origin)."
+                    )
                     st.dataframe(
                         det[cols].sort_values("first_contract_date"),
                         use_container_width=True, hide_index=True,
                         column_config={
                             "recurring_monthly": st.column_config.NumberColumn("Recurrente", format="%,.0f"),
-                            mrr_col: st.column_config.NumberColumn("MRR COP", format="$%,.0f"),
                         },
                     )
+            else:
+                st.caption("Sin suscripciones Staff que cumplan el filtro de cierre.")
         with st.expander("Detalle OV Staff (referencia: amount_untaxed de 1 período)"):
             s = k.get("sales_ov")
             if s is None or s.empty:
