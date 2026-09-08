@@ -43,7 +43,8 @@ from odoo_io import (
     month_list,
     resolve_linea_teams,
     staff_cierre_detail,
-    staff_vendido_monthly,
+    staff_cierre_monthly,
+    staff_recurrente_monthly,
     staffing_coverage,
     staffing_pnl_monthly,
     subscription_coverage,
@@ -58,8 +59,8 @@ st.set_page_config(
 
 
 # Vendido (Formación / Fábrica) = amount_untaxed_company (COP, OV + TRM).
-# Vendido (Staff) = Σ Recurrente (MRR) de suscripciones con Fecha del primer
-# contrato en el mes — igual que Odoo Suscripciones agrupado por first_contract_date.
+# Vendido Staff (KPI anual) = total con recurrencia: MRR × meses de vigencia.
+# Cierre Staff (gráfico mes a mes) = MRR nuevo por first_contract_date.
 # Facturado = amount_untaxed_signed → base imponible en COP compañía
 # (Odoo ya convierte USD→COP al contabilizar). NC restan.
 # amount_untaxed_in_currency_signed se muestra solo en debug (moneda documento).
@@ -279,12 +280,28 @@ renewals, err_ren = load_staffing_renewals(d1, d2)
 sub_logs, err_logs = load_subscription_logs(d1, d2, team_ids)
 projects, err_proj = load_projects(d1, d2)
 
-# Staff: vendido = cierre MRR por Fecha del primer contrato (como Suscripciones Odoo).
-staff_vendido_mes = staff_vendido_monthly(staff_req, subs_df, months_year, team_id=staff_team_id)
-staff_vendido_anual = float(staff_vendido_mes["vendido"].sum()) if not staff_vendido_mes.empty else 0.0
-staff_vendido_fuente = (
-    str(staff_vendido_mes["fuente"].iloc[0]) if not staff_vendido_mes.empty else "suscripciones"
+# Staff: KPI anual = total con recurrencia; gráfico = cierre por primer contrato.
+staff_recurrente_mes = staff_recurrente_monthly(
+    staff_req, subs_df, months_year, team_id=staff_team_id
 )
+staff_cierre_mes = staff_cierre_monthly(
+    staff_req, subs_df, months_year, team_id=staff_team_id
+)
+staff_vendido_anual = (
+    float(staff_recurrente_mes["vendido"].sum()) if not staff_recurrente_mes.empty else 0.0
+)
+staff_cierre_anual = (
+    float(staff_cierre_mes["vendido"].sum()) if not staff_cierre_mes.empty else 0.0
+)
+staff_vendido_fuente = (
+    str(staff_recurrente_mes["fuente"].iloc[0])
+    if not staff_recurrente_mes.empty else "recurrencia"
+)
+staff_cierre_fuente = (
+    str(staff_cierre_mes["fuente"].iloc[0]) if not staff_cierre_mes.empty else "cierre"
+)
+# Alias usados por gráficos de cierre mes a mes
+staff_vendido_mes = staff_cierre_mes
 
 st.title("📋 Dashboard Staff, Formación y Fábrica de Software")
 st.caption(
@@ -306,7 +323,8 @@ def kpis_linea(linea: str) -> dict:
     scol = sales_amount_col(sales)
     if linea == "Staff":
         vendido = staff_vendido_anual
-        sales_for_chart = staff_vendido_mes.rename(columns={"vendido": STAFF_VENDIDO_COL})
+        # El gráfico de "cierre mes a mes" usa el cierre; el KPI anual usa recurrencia.
+        sales_for_chart = staff_cierre_mes.rename(columns={"vendido": STAFF_VENDIDO_COL})
     else:
         vendido = float(sales[scol].sum()) if not sales.empty and scol in sales else 0.0
         sales_for_chart = sales
@@ -495,13 +513,16 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     if linea == "Staff":
         st.caption(
             f"Todos los pesos son **antes de impuestos**. "
-            f"**Vendido Staff** = Σ **Recurrente** (MRR) de suscripciones cuya "
-            f"**Fecha del primer contrato** cae en el mes "
+            f"**Vendido Staff (KPI de arriba)** = total con **recurrencia**: "
+            f"MRR de plazas vigentes × meses del año "
             f"(fuente: `{staff_vendido_fuente}`). "
-            f"Igual que Odoo → Suscripciones agrupado por ese campo. "
-            f"No suma plazas ya vigentes de meses anteriores. "
+            f"Hoy: {fmt_money(staff_vendido_anual)}. "
+            f"**Cierre del año** (solo contratos nuevos por Fecha del primer contrato): "
+            f"{fmt_money(staff_cierre_anual)} (`{staff_cierre_fuente}`). "
+            f"El gráfico de abajo es el **cierre mes a mes** (p. ej. agosto = 14M), "
+            f"no el acumulado recurrente. "
             f"**Facturado** = líneas de asiento `display_type=product` "
-            f"(−`balance` en COP compañía). Equipo = team_id del asiento."
+            f"(−`balance` en COP compañía)."
         )
     else:
         st.caption(
@@ -517,9 +538,20 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     chart_fact_y_leads(linea, k["invoices"], k["leads"])
     chart_leads_origen(linea, k["leads"])
     if linea == "Staff":
-        with st.expander("Detalle cierre Staff (suscripciones por Fecha del primer contrato)"):
+        with st.expander("Detalle total con recurrencia Staff (MRR × meses vigentes)"):
             st.dataframe(
-                staff_vendido_mes,
+                staff_recurrente_mes,
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "mes": "Mes",
+                    "vendido": st.column_config.NumberColumn("MRR vigente", format="$%,.0f"),
+                    "fuente": "Fuente",
+                },
+            )
+            st.caption(f"Suma anual (KPI de arriba): {fmt_money(staff_vendido_anual)}")
+        with st.expander("Detalle cierre Staff (Fecha del primer contrato — gráfico mes a mes)"):
+            st.dataframe(
+                staff_cierre_mes,
                 use_container_width=True, hide_index=True,
                 column_config={
                     "mes": "Mes",
@@ -538,9 +570,8 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                 ] if c in det.columns]
                 if cols:
                     st.caption(
-                        "Mismo corte que Odoo Suscripciones: equipo Staffing IT, "
-                        "estados En progreso / Pausada / Caducada (sin Renovada ni borrador), "
-                        "una fila por contrato (origin)."
+                        "Contratos nuevos del año (mismo corte que Odoo Suscripciones). "
+                        f"Suma cierre año: {fmt_money(staff_cierre_anual)}."
                     )
                     st.dataframe(
                         det[cols].sort_values("first_contract_date"),
@@ -652,8 +683,10 @@ with tab_resumen:
     )
     st.caption(
         f"Montos **antes de impuestos**. Para cuadrar en Odoo · "
-        f"**Vendido Staff:** Σ Recurrente (MRR) por **Fecha del primer contrato** "
-        f"(`{staff_vendido_fuente}`) — igual que Suscripciones en Odoo. "
+        f"**Vendido Staff (KPI):** total con recurrencia — MRR de plazas vigentes × meses "
+        f"(`{staff_vendido_fuente}`). "
+        f"**Cierre Staff (contratos nuevos):** {fmt_money(staff_cierre_anual)} por "
+        f"Fecha del primer contrato. "
         f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {anio} · "
         f"Confirmado · Importe sin impuestos. "
         f"**Facturado:** `account.move.line` publicadas · tipo **product** · "
@@ -788,10 +821,10 @@ with tab_resumen:
                          labels={FACT_COL: "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
     with col_b:
-        # Staff usa cierre por first_contract_date; Formación/Fábrica usan OV.
+        # Staff KPI = recurrencia; Formación/Fábrica = OV.
         partes = []
-        if not staff_vendido_mes.empty:
-            staff_part = staff_vendido_mes[["mes", "vendido"]].copy()
+        if not staff_recurrente_mes.empty:
+            staff_part = staff_recurrente_mes[["mes", "vendido"]].copy()
             staff_part["linea"] = "Staff"
             partes.append(staff_part.rename(columns={"vendido": "monto"}))
         scol = sales_amount_col(sales_all)
@@ -803,7 +836,7 @@ with tab_resumen:
         if partes:
             mensual_v = pd.concat(partes, ignore_index=True)
             fig = px.bar(mensual_v, x="mes", y="monto", color="linea", barmode="group",
-                         title="Vendido s/imp. mes a mes por línea (Staff = cierre MRR)",
+                         title="Vendido s/imp. mes a mes por línea (Staff = recurrencia)",
                          labels={"monto": "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
@@ -1196,7 +1229,8 @@ with st.sidebar.expander("Fuentes Odoo y pendientes"):
         """
 - **Plazas** → `firefly.staffing.request` (fallback: suscripciones)
 - **Renovaciones** → `firefly.staffing.history` (fallback: `sale.order.log`)
-- **Vendido Staff** → Σ Recurrente (MRR) por Fecha del primer contrato (suscripciones)
+- **Vendido Staff (KPI)** → total con recurrencia: MRR × meses de vigencia
+- **Cierre Staff (gráfico)** → MRR nuevo por Fecha del primer contrato
 - **Vendido Formación/Fábrica** → OV confirmadas por `date_order`, s/imp. en COP
 - **Facturado** → `account.move.line` tipo product, −`balance` (COP compañía)
 - **Leads / origen** → `crm.lead` + `source_id` (equipo CRM)

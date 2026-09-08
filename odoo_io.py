@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
-_DATA_VERSION = 13
+_DATA_VERSION = 14
 
 
 def allowed_team_ids() -> set[int]:
@@ -1239,9 +1239,9 @@ def staffing_cierre_monthly(requests: pd.DataFrame, months: list[str]) -> pd.Dat
     return out
 
 
-def staff_vendido_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | None,
-                          months: list[str], team_id: int | None = None) -> pd.DataFrame:
-    """Cierre de venta Staff: suscripciones por first_contract_date; si no hay, solicitudes."""
+def staff_cierre_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | None,
+                         months: list[str], team_id: int | None = None) -> pd.DataFrame:
+    """Cierre comercial: MRR nuevo por Fecha del primer contrato (mes a mes)."""
     if subs is not None and not subs.empty:
         return subscription_cierre_monthly(subs, months, team_id=team_id)
     return staffing_cierre_monthly(
@@ -1250,8 +1250,65 @@ def staff_vendido_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | No
 
 
 def staff_cierre_detail(subs: pd.DataFrame | None, team_id: int | None = None) -> pd.DataFrame:
-    """Detalle de suscripciones que entran al cierre (mismo filtro que el KPI)."""
+    """Detalle de suscripciones que entran al cierre (mismo filtro que el KPI de cierre)."""
     return _subscription_cierre_frame(subs if subs is not None else pd.DataFrame(), team_id=team_id)
+
+
+def subscription_recurrente_monthly(subs: pd.DataFrame, months: list[str],
+                                    team_id: int | None = None) -> pd.DataFrame:
+    """Total con recurrencia: Σ MRR de contratos vigentes en cada mes (cobertura)."""
+    fuente = "sale.order · MRR × meses de vigencia (recurrencia)"
+    if not months:
+        return pd.DataFrame(columns=["mes", "vendido", "fuente"])
+    empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
+                          "fuente": [fuente] * len(months)})
+    sub = _subscription_cierre_frame(subs, team_id=team_id)
+    if sub.empty:
+        return empty
+    tmp = sub.copy()
+    start = tmp["start_date"] if "start_date" in tmp.columns else tmp["first_contract_date"]
+    if "first_contract_date" in tmp.columns:
+        start = start.fillna(tmp["first_contract_date"])
+    tmp["date_start"] = start
+    tmp["date_end"] = tmp["end_date"] if "end_date" in tmp.columns else pd.NaT
+    tmp["_mrr"] = pd.to_numeric(tmp.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
+    rows = []
+    for mes in months:
+        mask = coverage_mask(tmp, "date_start", "date_end", mes)
+        rows.append({"mes": mes, "vendido": float(tmp.loc[mask, "_mrr"].sum()), "fuente": fuente})
+    return pd.DataFrame(rows)
+
+
+def staffing_recurrente_monthly(requests: pd.DataFrame, months: list[str]) -> pd.DataFrame:
+    """Total con recurrencia desde solicitudes Staff (MRR × meses de vigencia)."""
+    fuente = "firefly.staffing.request · MRR × meses de vigencia"
+    if not months:
+        return pd.DataFrame(columns=["mes", "vendido", "fuente"])
+    if requests is None or requests.empty:
+        return pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
+                             "fuente": [fuente] * len(months)})
+    pnl = staffing_pnl_monthly(requests, months, 0.0)
+    return pd.DataFrame({
+        "mes": pnl["mes"],
+        "vendido": pnl["ingreso_plazas"].astype(float),
+        "fuente": fuente,
+    })
+
+
+def staff_recurrente_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | None,
+                             months: list[str], team_id: int | None = None) -> pd.DataFrame:
+    """KPI anual Staff: total vendido con recurrencia (plazas vigentes × MRR por mes)."""
+    if requests is not None and not requests.empty:
+        return staffing_recurrente_monthly(requests, months)
+    return subscription_recurrente_monthly(
+        subs if subs is not None else pd.DataFrame(), months, team_id=team_id
+    )
+
+
+# Compat: nombre antiguo → cierre comercial.
+def staff_vendido_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | None,
+                          months: list[str], team_id: int | None = None) -> pd.DataFrame:
+    return staff_cierre_monthly(requests, subs, months, team_id=team_id)
 
 
 # ─────────────────────────────────────────────
