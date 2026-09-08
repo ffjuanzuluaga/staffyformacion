@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
-_DATA_VERSION = 14
+_DATA_VERSION = 15
 
 
 def allowed_team_ids() -> set[int]:
@@ -1007,7 +1007,7 @@ def load_subscriptions(team_id: int | None):
     wanted = [
         "name", "partner_id", "subscription_state", "start_date", "end_date",
         "first_contract_date", "origin_order_id", "team_id", "next_invoice_date",
-        "recurring_monthly", "staff_request_id", "user_id", "amount_untaxed",
+        "recurring_monthly", "plan_id", "staff_request_id", "user_id", "amount_untaxed",
         "currency_id", "currency_rate",
     ]
     have = available_fields("sale.order")
@@ -1048,6 +1048,7 @@ def load_subscriptions(team_id: int | None):
     df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
     df["equipo_id"] = m2o_id(df["team_id"]) if "team_id" in df else None
     df["origin_id"] = m2o_id(df["origin_order_id"]) if "origin_order_id" in df else df.get("id")
+    df["plan"] = m2o_name(df["plan_id"]) if "plan_id" in df else ""
     df["moneda"] = m2o_name(df["currency_id"]) if "currency_id" in df else "COP"
 
     # Recurrente (MRR). Para cierre comercial usamos la cifra del listado Odoo
@@ -1256,8 +1257,13 @@ def staff_cierre_detail(subs: pd.DataFrame | None, team_id: int | None = None) -
 
 def subscription_recurrente_monthly(subs: pd.DataFrame, months: list[str],
                                     team_id: int | None = None) -> pd.DataFrame:
-    """Total con recurrencia: Σ MRR de contratos vigentes en cada mes (cobertura)."""
-    fuente = "sale.order · MRR × meses de vigencia (recurrencia)"
+    """Total con recurrencia = valor Recurrente × periodos del plan en vigencia.
+
+    Con plan mensual (el de Staff): cada mes vigente aporta `recurring_monthly`
+    (ya es el valor de la suscripción normalizado al plan). Suma anual ≈ los ~333M
+    cuando hay plazas activas todo el año.
+    """
+    fuente = "suscripción × plan recurrente (Recurrente × meses vigentes)"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -1271,6 +1277,7 @@ def subscription_recurrente_monthly(subs: pd.DataFrame, months: list[str],
         start = start.fillna(tmp["first_contract_date"])
     tmp["date_start"] = start
     tmp["date_end"] = tmp["end_date"] if "end_date" in tmp.columns else pd.NaT
+    # recurring_monthly = valor del pedido según plan, ya llevado a base mensual.
     tmp["_mrr"] = pd.to_numeric(tmp.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
     rows = []
     for mes in months:
@@ -1280,8 +1287,8 @@ def subscription_recurrente_monthly(subs: pd.DataFrame, months: list[str],
 
 
 def staffing_recurrente_monthly(requests: pd.DataFrame, months: list[str]) -> pd.DataFrame:
-    """Total con recurrencia desde solicitudes Staff (MRR × meses de vigencia)."""
-    fuente = "firefly.staffing.request · MRR × meses de vigencia"
+    """Fallback: valor mensual de la plaza × meses de vigencia (equivalente a plan mensual)."""
+    fuente = "firefly.staffing.request · valor mensual × meses (plan mensual)"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     if requests is None or requests.empty:
@@ -1297,11 +1304,17 @@ def staffing_recurrente_monthly(requests: pd.DataFrame, months: list[str]) -> pd
 
 def staff_recurrente_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | None,
                              months: list[str], team_id: int | None = None) -> pd.DataFrame:
-    """KPI anual Staff: total vendido con recurrencia (plazas vigentes × MRR por mes)."""
-    if requests is not None and not requests.empty:
-        return staffing_recurrente_monthly(requests, months)
-    return subscription_recurrente_monthly(
-        subs if subs is not None else pd.DataFrame(), months, team_id=team_id
+    """KPI anual Staff: valor suscripción × plan recurrente (periodos vigentes del año).
+
+    Prioriza suscripciones Odoo (Recurrente × meses si el plan es mensual).
+    Si no hay suscripciones, usa solicitudes Staff.
+    """
+    if subs is not None and not subs.empty:
+        out = subscription_recurrente_monthly(subs, months, team_id=team_id)
+        if not out.empty and float(out["vendido"].sum()) > 0:
+            return out
+    return staffing_recurrente_monthly(
+        requests if requests is not None else pd.DataFrame(), months
     )
 
 

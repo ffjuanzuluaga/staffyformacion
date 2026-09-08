@@ -513,16 +513,13 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     if linea == "Staff":
         st.caption(
             f"Todos los pesos son **antes de impuestos**. "
-            f"**Vendido Staff (KPI de arriba)** = total con **recurrencia**: "
-            f"MRR de plazas vigentes × meses del año "
-            f"(fuente: `{staff_vendido_fuente}`). "
-            f"Hoy: {fmt_money(staff_vendido_anual)}. "
+            f"**Vendido Staff (KPI de arriba)** = valor de la suscripción × plan recurrente "
+            f"(columna **Recurrente** × cada mes vigente; plan mensual → × meses del año). "
+            f"Fuente: `{staff_vendido_fuente}`. Hoy: {fmt_money(staff_vendido_anual)}. "
             f"**Cierre del año** (solo contratos nuevos por Fecha del primer contrato): "
             f"{fmt_money(staff_cierre_anual)} (`{staff_cierre_fuente}`). "
-            f"El gráfico de abajo es el **cierre mes a mes** (p. ej. agosto = 14M), "
-            f"no el acumulado recurrente. "
-            f"**Facturado** = líneas de asiento `display_type=product` "
-            f"(−`balance` en COP compañía)."
+            f"El gráfico de abajo es el **cierre mes a mes** (p. ej. agosto = 14M). "
+            f"**Facturado** = líneas de asiento `display_type=product` (−`balance` COP)."
         )
     else:
         st.caption(
@@ -538,17 +535,20 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     chart_fact_y_leads(linea, k["invoices"], k["leads"])
     chart_leads_origen(linea, k["leads"])
     if linea == "Staff":
-        with st.expander("Detalle total con recurrencia Staff (MRR × meses vigentes)"):
+        with st.expander("Detalle total con recurrencia (valor suscripción × plan)"):
             st.dataframe(
                 staff_recurrente_mes,
                 use_container_width=True, hide_index=True,
                 column_config={
                     "mes": "Mes",
-                    "vendido": st.column_config.NumberColumn("MRR vigente", format="$%,.0f"),
+                    "vendido": st.column_config.NumberColumn("Valor × plan (mes)", format="$%,.0f"),
                     "fuente": "Fuente",
                 },
             )
-            st.caption(f"Suma anual (KPI de arriba): {fmt_money(staff_vendido_anual)}")
+            st.caption(
+                f"Suma anual (KPI de arriba): {fmt_money(staff_vendido_anual)}. "
+                "Con plan mensual: cada mes vigente suma el Recurrente de la suscripción."
+            )
         with st.expander("Detalle cierre Staff (Fecha del primer contrato — gráfico mes a mes)"):
             st.dataframe(
                 staff_cierre_mes,
@@ -683,8 +683,8 @@ with tab_resumen:
     )
     st.caption(
         f"Montos **antes de impuestos**. Para cuadrar en Odoo · "
-        f"**Vendido Staff (KPI):** total con recurrencia — MRR de plazas vigentes × meses "
-        f"(`{staff_vendido_fuente}`). "
+        f"**Vendido Staff (KPI):** valor suscripción × plan recurrente "
+        f"(Recurrente × meses vigentes; `{staff_vendido_fuente}`). "
         f"**Cierre Staff (contratos nuevos):** {fmt_money(staff_cierre_anual)} por "
         f"Fecha del primer contrato. "
         f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {anio} · "
@@ -1229,7 +1229,7 @@ with st.sidebar.expander("Fuentes Odoo y pendientes"):
         """
 - **Plazas** → `firefly.staffing.request` (fallback: suscripciones)
 - **Renovaciones** → `firefly.staffing.history` (fallback: `sale.order.log`)
-- **Vendido Staff (KPI)** → total con recurrencia: MRR × meses de vigencia
+- **Vendido Staff (KPI)** → valor suscripción × plan recurrente (Recurrente × meses vigentes)
 - **Cierre Staff (gráfico)** → MRR nuevo por Fecha del primer contrato
 - **Vendido Formación/Fábrica** → OV confirmadas por `date_order`, s/imp. en COP
 - **Facturado** → `account.move.line` tipo product, −`balance` (COP compañía)
