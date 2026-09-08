@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación.
-_DATA_VERSION = 10
+_DATA_VERSION = 11
 
 
 def allowed_team_ids() -> set[int]:
@@ -1119,6 +1119,63 @@ def staffing_pnl_monthly(requests: pd.DataFrame, months: list[str],
             "valor_recurso_promedio": (costo / n) if n else 0.0,
         })
     return pd.DataFrame(rows)
+
+
+# Borradores / renovación en curso no cuentan como vendido recurrente.
+SUB_VENDIDO_SKIP_STATES = ("1_draft", "2_renewal")
+
+
+def staffing_vendido_monthly(requests: pd.DataFrame, months: list[str]) -> pd.DataFrame:
+    """Vendido Staff = MRR en moneda compañía × meses de vigencia en el período.
+
+    Las OV de suscripción guardan solo un período (`amount_untaxed` ≈ fee mensual).
+    La meta anual de Staff es ingreso recurrente, no el importe de una sola OV.
+    """
+    if not months:
+        return pd.DataFrame(columns=["mes", "vendido", "fuente"])
+    if requests is None or requests.empty:
+        return pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
+                             "fuente": ["firefly.staffing.request"] * len(months)})
+    pnl = staffing_pnl_monthly(requests, months, 0.0)
+    return pd.DataFrame({
+        "mes": pnl["mes"],
+        "vendido": pnl["ingreso_plazas"].astype(float),
+        "fuente": "firefly.staffing.request",
+    })
+
+
+def subscription_vendido_monthly(subs: pd.DataFrame, months: list[str]) -> pd.DataFrame:
+    """Fallback: MRR de suscripciones (`recurring_monthly` o amount_untaxed) por mes de cobertura."""
+    if not months:
+        return pd.DataFrame(columns=["mes", "vendido", "fuente"])
+    if subs is None or subs.empty:
+        return pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
+                             "fuente": ["sale.order suscripción"] * len(months)})
+    sub = subs
+    if "subscription_state" in subs.columns:
+        sub = subs[~subs["subscription_state"].isin(SUB_VENDIDO_SKIP_STATES)].copy()
+    amount_col = "recurring_monthly" if "recurring_monthly" in sub.columns else "amount_untaxed"
+    if amount_col not in sub.columns:
+        return pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
+                             "fuente": ["sale.order suscripción"] * len(months)})
+    amounts = pd.to_numeric(sub[amount_col], errors="coerce").fillna(0.0)
+    rows = []
+    for mes in months:
+        mask = coverage_mask(sub, "start_date", "end_date", mes)
+        rows.append({
+            "mes": mes,
+            "vendido": float(amounts[mask].sum()),
+            "fuente": "sale.order suscripción",
+        })
+    return pd.DataFrame(rows)
+
+
+def staff_vendido_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | None,
+                          months: list[str]) -> pd.DataFrame:
+    """Serie mensual de vendido Staff: solicitudes primero, suscripciones si no hay."""
+    if requests is not None and not requests.empty:
+        return staffing_vendido_monthly(requests, months)
+    return subscription_vendido_monthly(subs if subs is not None else pd.DataFrame(), months)
 
 
 # ─────────────────────────────────────────────

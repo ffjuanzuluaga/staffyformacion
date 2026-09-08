@@ -42,6 +42,7 @@ from odoo_io import (
     load_won,
     month_list,
     resolve_linea_teams,
+    staff_vendido_monthly,
     staffing_coverage,
     staffing_pnl_monthly,
     subscription_coverage,
@@ -55,7 +56,9 @@ st.set_page_config(
 )
 
 
-# Vendido = amount_untaxed_company (COP, OV convertidas con TRM).
+# Vendido (Formación / Fábrica) = amount_untaxed_company (COP, OV + TRM).
+# Vendido (Staff) = MRR recurrente × meses de vigencia (suscripciones), no el
+# amount_untaxed de una sola OV (que solo refleja un período de facturación).
 # Facturado = amount_untaxed_signed → base imponible en COP compañía
 # (Odoo ya convierte USD→COP al contabilizar). NC restan.
 # amount_untaxed_in_currency_signed se muestra solo en debug (moneda documento).
@@ -63,6 +66,7 @@ SALES_COL = "amount_untaxed_company"
 SALES_COL_FALLBACK = "amount_untaxed"
 FACT_COL = "amount_untaxed_signed"
 FACT_COL_DOC = "amount_untaxed_in_currency_signed"
+STAFF_VENDIDO_COL = "vendido"
 
 
 def fmt_money(v: float) -> str:
@@ -274,6 +278,13 @@ renewals, err_ren = load_staffing_renewals(d1, d2)
 sub_logs, err_logs = load_subscription_logs(d1, d2, team_ids)
 projects, err_proj = load_projects(d1, d2)
 
+# Staff: vendido = valor mensual recurrente × meses de cobertura (no OV única).
+staff_vendido_mes = staff_vendido_monthly(staff_req, subs_df, months_year)
+staff_vendido_anual = float(staff_vendido_mes["vendido"].sum()) if not staff_vendido_mes.empty else 0.0
+staff_vendido_fuente = (
+    str(staff_vendido_mes["fuente"].iloc[0]) if not staff_vendido_mes.empty else "suscripciones"
+)
+
 st.title("📋 Dashboard Staff, Formación y Fábrica de Software")
 st.caption(
     f"Año {anio} · montos **antes de impuestos** · "
@@ -292,7 +303,12 @@ def kpis_linea(linea: str) -> dict:
     leads = filtro_linea(leads_all, linea)
     meta = meta_anual_de(metas_lineas, linea)
     scol = sales_amount_col(sales)
-    vendido = float(sales[scol].sum()) if not sales.empty and scol in sales else 0.0
+    if linea == "Staff":
+        vendido = staff_vendido_anual
+        sales_for_chart = staff_vendido_mes.rename(columns={"vendido": STAFF_VENDIDO_COL})
+    else:
+        vendido = float(sales[scol].sum()) if not sales.empty and scol in sales else 0.0
+        sales_for_chart = sales
     facturado = float(invoices[FACT_COL].sum()) if not invoices.empty and FACT_COL in invoices else 0.0
     leads_mes = int(leads.loc[leads["mes"] == mes_actual_key].shape[0]) if not leads.empty else 0
     return {
@@ -301,7 +317,8 @@ def kpis_linea(linea: str) -> dict:
         "facturado_anual": facturado,
         "pct_cumpl": (vendido / meta * 100) if meta else 0.0,
         "leads_mes": leads_mes,
-        "sales": sales,
+        "sales": sales_for_chart,
+        "sales_ov": sales,
         "invoices": invoices,
         "leads": leads,
         "won": filtro_linea(won_all, linea),
@@ -331,11 +348,21 @@ def rentabilidad_contable(linea: str) -> pd.DataFrame:
 def chart_venta_vs_meta(linea: str, sales: pd.DataFrame):
     st.markdown("#### 💰 Cierre de venta mes a mes vs. meta (antes de impuestos)")
     meta_m = meta_anual_de(metas_lineas, linea) / 12
-    scol = sales_amount_col(sales)
-    ventas_mes = (
-        sales.groupby("mes", as_index=False)[scol].sum()
-        if not sales.empty and scol in sales else pd.DataFrame(columns=["mes", scol])
-    )
+    if linea == "Staff":
+        scol = STAFF_VENDIDO_COL
+        titulo = f"{linea} — vendido recurrente (MRR×plazas) vs. meta mensual ({anio})"
+        ventas_mes = (
+            sales.groupby("mes", as_index=False)[scol].sum()
+            if sales is not None and not sales.empty and scol in sales
+            else pd.DataFrame(columns=["mes", scol])
+        )
+    else:
+        scol = sales_amount_col(sales)
+        titulo = f"{linea} — vendido s/imp. (OV) vs. meta mensual ({anio})"
+        ventas_mes = (
+            sales.groupby("mes", as_index=False)[scol].sum()
+            if not sales.empty and scol in sales else pd.DataFrame(columns=["mes", scol])
+        )
     base = pd.DataFrame({"mes": months_year}).merge(ventas_mes, on="mes", how="left")
     base[scol] = base[scol].fillna(0)
     base["meta_mensual"] = meta_m
@@ -344,7 +371,7 @@ def chart_venta_vs_meta(linea: str, sales: pd.DataFrame):
     largo["concepto"] = largo["concepto"].map({"meta_mensual": "Meta mensual", scol: "Vendido"})
     fig = px.bar(
         largo, x="mes", y="valor", color="concepto", barmode="group",
-        title=f"{linea} — vendido s/imp. (OV) vs. meta mensual ({anio})",
+        title=titulo,
         color_discrete_map={"Meta mensual": "#9ca3af", "Vendido": "#1f77b4"},
         labels={"valor": "COP s/imp.", "mes": "Mes"},
     )
@@ -464,37 +491,78 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     c2.metric(f"Vendido s/imp. en {linea} (año)", fmt_money(k["vendido_anual"]))
     c3.metric("Facturación s/imp. (año)", fmt_money(k["facturado_anual"]))
     c4.metric("Leads del mes", k["leads_mes"])
-    st.caption(
-        f"Todos los pesos son **antes de impuestos**. "
-        f"**Vendido** = OV confirmadas por **Fecha del pedido**, importe s/imp. "
-        f"**convertido a COP** con la TRM (`currency_rate`). "
-        f"Si la OV está en USD y no hay tasa, el monto no se convierte (ver aviso arriba). "
-        f"**Facturado** = líneas de asiento `display_type=product` "
-        f"(−`balance` en COP compañía, misma fórmula que Odoo). "
-        f"Equipo = team_id del asiento."
-    )
+    if linea == "Staff":
+        st.caption(
+            f"Todos los pesos son **antes de impuestos**. "
+            f"**Vendido Staff** = valor mensual de plazas vigentes × meses del año "
+            f"(fuente: `{staff_vendido_fuente}`). Las OV de suscripción solo traen "
+            f"un período (`amount_untaxed` ≈ fee mensual); no se usan para la meta. "
+            f"**Facturado** = líneas de asiento `display_type=product` "
+            f"(−`balance` en COP compañía). Equipo = team_id del asiento."
+        )
+    else:
+        st.caption(
+            f"Todos los pesos son **antes de impuestos**. "
+            f"**Vendido** = OV confirmadas por **Fecha del pedido**, importe s/imp. "
+            f"**convertido a COP** con la TRM (`currency_rate`). "
+            f"Si la OV está en USD y no hay tasa, el monto no se convierte (ver aviso arriba). "
+            f"**Facturado** = líneas de asiento `display_type=product` "
+            f"(−`balance` en COP compañía, misma fórmula que Odoo). "
+            f"Equipo = team_id del asiento."
+        )
     chart_venta_vs_meta(linea, k["sales"])
     chart_fact_y_leads(linea, k["invoices"], k["leads"])
     chart_leads_origen(linea, k["leads"])
-    with st.expander(f"Detalle OV {linea} (s/imp. en COP)"):
-        s = k["sales"]
-        if s is None or s.empty:
-            st.caption("Sin órdenes confirmadas.")
-        else:
-            cols = [c for c in [
-                "name", "date_order", "cliente", "vendedor", "equipo", "moneda",
-                "amount_untaxed", "currency_rate", "amount_untaxed_company", "fx_sin_trm",
-            ] if c in s.columns]
+    if linea == "Staff":
+        with st.expander("Detalle vendido recurrente Staff (mes a mes)"):
             st.dataframe(
-                s[cols].sort_values("date_order"),
+                staff_vendido_mes,
                 use_container_width=True, hide_index=True,
                 column_config={
-                    "amount_untaxed": st.column_config.NumberColumn("S/imp. moneda OV", format="%,.2f"),
-                    "currency_rate": st.column_config.NumberColumn("TRM (currency_rate)", format="%.6f"),
-                    "amount_untaxed_company": st.column_config.NumberColumn("S/imp. COP", format="$%,.0f"),
-                    "fx_sin_trm": "Sin TRM",
+                    "mes": "Mes",
+                    "vendido": st.column_config.NumberColumn("Vendido (MRR plazas)", format="$%,.0f"),
+                    "fuente": "Fuente",
                 },
             )
+        with st.expander("Detalle OV Staff (referencia: 1 período, no suman a meta)"):
+            s = k.get("sales_ov")
+            if s is None or s.empty:
+                st.caption("Sin órdenes confirmadas.")
+            else:
+                cols = [c for c in [
+                    "name", "date_order", "cliente", "vendedor", "equipo", "moneda",
+                    "amount_untaxed", "currency_rate", "amount_untaxed_company", "fx_sin_trm",
+                ] if c in s.columns]
+                st.dataframe(
+                    s[cols].sort_values("date_order"),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "amount_untaxed": st.column_config.NumberColumn("S/imp. moneda OV", format="%,.2f"),
+                        "currency_rate": st.column_config.NumberColumn("TRM (currency_rate)", format="%.6f"),
+                        "amount_untaxed_company": st.column_config.NumberColumn("S/imp. COP", format="$%,.0f"),
+                        "fx_sin_trm": "Sin TRM",
+                    },
+                )
+    else:
+        with st.expander(f"Detalle OV {linea} (s/imp. en COP)"):
+            s = k["sales"]
+            if s is None or s.empty:
+                st.caption("Sin órdenes confirmadas.")
+            else:
+                cols = [c for c in [
+                    "name", "date_order", "cliente", "vendedor", "equipo", "moneda",
+                    "amount_untaxed", "currency_rate", "amount_untaxed_company", "fx_sin_trm",
+                ] if c in s.columns]
+                st.dataframe(
+                    s[cols].sort_values("date_order"),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "amount_untaxed": st.column_config.NumberColumn("S/imp. moneda OV", format="%,.2f"),
+                        "currency_rate": st.column_config.NumberColumn("TRM (currency_rate)", format="%.6f"),
+                        "amount_untaxed_company": st.column_config.NumberColumn("S/imp. COP", format="$%,.0f"),
+                        "fx_sin_trm": "Sin TRM",
+                    },
+                )
     return k
 
 
@@ -557,8 +625,10 @@ with tab_resumen:
     )
     st.caption(
         f"Montos **antes de impuestos**. Para cuadrar en Odoo · "
-        f"**Vendido:** Ventas → Pedidos · Fecha del pedido = {anio} · Confirmado · "
-        f"Importe sin impuestos. "
+        f"**Vendido Staff:** valor mensual de plazas vigentes × meses "
+        f"(`{staff_vendido_fuente}`), no el importe de una sola OV de suscripción. "
+        f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {anio} · "
+        f"Confirmado · Importe sin impuestos. "
         f"**Facturado:** `account.move.line` publicadas · tipo **product** · "
         f"**−balance** (COP compañía, TRM de la factura). "
         f"Equipo del asiento. TRANSFORMACION DIGITAL no entra."
@@ -691,13 +761,23 @@ with tab_resumen:
                          labels={FACT_COL: "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
     with col_b:
+        # Staff usa MRR recurrente; Formación/Fábrica usan OV por date_order.
+        partes = []
+        if not staff_vendido_mes.empty:
+            staff_part = staff_vendido_mes[["mes", "vendido"]].copy()
+            staff_part["linea"] = "Staff"
+            partes.append(staff_part.rename(columns={"vendido": "monto"}))
         scol = sales_amount_col(sales_all)
         if not sales_all.empty and scol in sales_all.columns:
-            mensual_v = sales_all[sales_all["linea"] != "Sin línea"].groupby(
-                ["mes", "linea"], as_index=False)[scol].sum()
-            fig = px.bar(mensual_v, x="mes", y=scol, color="linea", barmode="group",
-                         title="Vendido s/imp. (OV) mes a mes por línea",
-                         labels={scol: "COP s/imp.", "mes": "Mes"})
+            otras = sales_all[sales_all["linea"].isin(["Formación", "Fábrica de Software"])]
+            if not otras.empty:
+                otras_m = otras.groupby(["mes", "linea"], as_index=False)[scol].sum()
+                partes.append(otras_m.rename(columns={scol: "monto"}))
+        if partes:
+            mensual_v = pd.concat(partes, ignore_index=True)
+            fig = px.bar(mensual_v, x="mes", y="monto", color="linea", barmode="group",
+                         title="Vendido s/imp. mes a mes por línea (Staff = recurrente)",
+                         labels={"monto": "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
 
@@ -1067,6 +1147,10 @@ with tab_vendedor:
             )
 
     st.markdown("#### 📦 Órdenes confirmadas por vendedor, mes y línea (s/imp.)")
+    st.caption(
+        "Para Staff, el importe de la OV es **un período** de la suscripción (MRR), "
+        "no el vendido anual. El cumplimiento de meta Staff usa el valor recurrente de plazas."
+    )
     scol = sales_amount_col(sales_vend)
     if sales_vend.empty or scol not in sales_vend.columns:
         st.info("No hay órdenes confirmadas en el período.")
@@ -1085,7 +1169,8 @@ with st.sidebar.expander("Fuentes Odoo y pendientes"):
         """
 - **Plazas** → `firefly.staffing.request` (fallback: suscripciones)
 - **Renovaciones** → `firefly.staffing.history` (fallback: `sale.order.log`)
-- **Vendido** → OV confirmadas por `date_order`, s/imp. en COP (`amount_untaxed` ÷ `currency_rate`)
+- **Vendido Staff** → MRR de plazas × meses de vigencia (suscripciones recurrentes)
+- **Vendido Formación/Fábrica** → OV confirmadas por `date_order`, s/imp. en COP
 - **Facturado** → `account.move.line` tipo product, −`balance` (COP compañía)
 - **Leads / origen** → `crm.lead` + `source_id` (equipo CRM)
 - **Cursos/proyectos entregados** → `project.project.service_line` (fecha fin = proxy)
