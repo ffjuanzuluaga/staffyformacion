@@ -35,23 +35,27 @@ from odoo_io import (
     load_sales_team_employees,
     load_staffing_renewals,
     load_staffing_requests,
-    load_sale_order_log_report,
     load_subscription_logs,
-    load_subscription_plans,
     load_subscriptions,
     load_team_activities,
     load_teams,
     load_won,
     month_list,
-    plan_period_months,
     resolve_linea_teams,
-    staff_cierre_detail,
-    staff_cierre_monthly,
     staff_recurrente_monthly,
     staffing_coverage,
     staffing_pnl_monthly,
     subscription_coverage,
     team_id_for_linea,
+)
+
+# Módulo aparte: evita ImportError si Streamlit Cloud deja odoo_io desfasado.
+from mrr_cierre import (
+    load_sale_order_log_report,
+    load_subscription_plans,
+    plan_period_months,
+    staff_cierre_detail,
+    staff_cierre_monthly,
 )
 
 st.set_page_config(
