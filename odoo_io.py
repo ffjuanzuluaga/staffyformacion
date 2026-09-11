@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
-_DATA_VERSION = 19
+_DATA_VERSION = 20
 
 
 def allowed_team_ids() -> set[int]:
@@ -1433,8 +1433,8 @@ def subscription_cierre_monthly(subs: pd.DataFrame, months: list[str],
 
 
 def staffing_cierre_monthly(requests: pd.DataFrame, months: list[str]) -> pd.DataFrame:
-    """Fallback sin suscripciones: valor mensual de la plaza en el mes de date_start."""
-    fuente = "firefly.staffing.request · date_start (valor mensual)"
+    """Fallback: valor mensual × meses (date_start→date_end) en el mes de date_start."""
+    fuente = "firefly.staffing.request · valor mensual × meses del contrato"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -1448,10 +1448,23 @@ def staffing_cierre_monthly(requests: pd.DataFrame, months: list[str]) -> pd.Dat
     if usable.empty:
         return empty
     usable["mes"] = usable["date_start"].dt.to_period("M").astype(str)
-    usable["_mrr"] = pd.to_numeric(
-        usable.get("monthly_amount_company_currency", 0), errors="coerce"
-    ).fillna(0.0)
-    por_mes = usable.groupby("mes", as_index=False)["_mrr"].sum().rename(columns={"_mrr": "vendido"})
+    usable = usable[usable["mes"].isin(months)].copy()
+    if usable.empty:
+        return empty
+    mrr = pd.to_numeric(usable.get("monthly_amount_company_currency", 0), errors="coerce").fillna(0.0)
+    end = usable["date_end"] if "date_end" in usable.columns else pd.Series(pd.NaT, index=usable.index)
+    vals = []
+    for m, s, e in zip(mrr, usable["date_start"], end):
+        if pd.isna(s):
+            meses = 1
+        elif pd.isna(e):
+            meses = 1
+        else:
+            sp, ep = pd.Period(s, freq="M"), pd.Period(e, freq="M")
+            meses = 1 if ep < sp else int((ep - sp).n) + 1
+        vals.append(float(m) * meses)
+    usable["_valor"] = vals
+    por_mes = usable.groupby("mes", as_index=False)["_valor"].sum().rename(columns={"_valor": "vendido"})
     out = pd.DataFrame({"mes": months}).merge(por_mes, on="mes", how="left")
     out["vendido"] = out["vendido"].fillna(0.0)
     out["fuente"] = fuente

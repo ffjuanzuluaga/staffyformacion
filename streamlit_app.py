@@ -419,7 +419,7 @@ def chart_venta_vs_meta(linea: str, sales: pd.DataFrame):
     meta_m = meta_anual_de(metas_lineas, linea) / 12
     if linea == "Staff":
         scol = STAFF_VENDIDO_COL
-        titulo = f"{linea} — cierre (recurring_total / MRR×plan) vs. meta mensual ({periodo_label})"
+        titulo = f"{linea} — cierre (MRR × meses del contrato) vs. meta ({periodo_label})"
         ventas_mes = (
             sales.groupby("mes", as_index=False)[scol].sum()
             if sales is not None and not sales.empty and scol in sales
@@ -566,9 +566,9 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
             f"**Vendido Staff (KPI de arriba)** = valor mensual de la plaza × meses vigentes "
             f"(equivalente a suscripción × plan mensual; fuente: `{staff_vendido_fuente}`). "
             f"Hoy: {fmt_money(staff_vendido_anual)}. "
-            f"**Cierre del período** (`recurring_total` / MRR×plan por Fecha primer contrato): "
+            f"**Cierre del período** (en la fecha del contrato: valor mensual × meses hasta el fin): "
             f"{fmt_money(staff_cierre_anual)} (`{staff_cierre_fuente}`). "
-            f"Ej.: plan trimestral 8M → 24M; plan mensual 14M → 14M. "
+            f"Ej.: 8M × 3 meses = 24M; si dura 1 mes = solo ese valor. "
             f"**Facturado** = líneas de asiento `display_type=product` (−`balance` COP)."
         )
     else:
@@ -599,63 +599,54 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                 f"Suma anual (KPI de arriba): {fmt_money(staff_vendido_anual)}. "
                 "Con plan mensual: cada mes vigente suma el Recurrente de la suscripción."
             )
-        with st.expander("Detalle cierre Staff (contratos nuevos — gráfico mes a mes)"):
+        with st.expander("Detalle cierre Staff (MRR × meses del contrato)"):
             st.dataframe(
                 staff_cierre_mes,
                 use_container_width=True, hide_index=True,
                 column_config={
                     "mes": "Mes",
-                    "vendido": st.column_config.NumberColumn("Valor cerrado", format="$%,.0f"),
+                    "vendido": st.column_config.NumberColumn("Vendido (cierre)", format="$%,.0f"),
                     "fuente": "Fuente",
                 },
             )
             det = staff_cierre_detail(subs_df, team_id=staff_team_id)
             if det is not None and not det.empty:
+                from mrr_cierre import contract_months, valor_vendido_contrato
                 det = det.copy()
                 det = det[det["first_contract_date"].notna()]
                 det["mes"] = det["first_contract_date"].dt.to_period("M").astype(str)
                 det = det[det["mes"].isin(months_year)]
-                if "plan_id" in det.columns:
-                    from mrr_cierre import plan_period_months, _plan_factor_series, _valor_contrato_row
-                    det["plan_id_num"] = det["plan_id"].map(
-                        lambda v: int(v[0]) if isinstance(v, (list, tuple)) and v else (
-                            int(v) if isinstance(v, (int, float)) and not pd.isna(v) else None
-                        )
-                    )
-                    factor = _plan_factor_series(det, sub_plans)
-                    det["periodo_plan"] = factor
-                    det["valor_cierre"] = [
-                        _valor_contrato_row(
-                            det.at[i, "recurring_total"] if "recurring_total" in det.columns else 0,
-                            det.at[i, "amount_untaxed"] if "amount_untaxed" in det.columns else 0,
-                            det.at[i, "recurring_monthly"] if "recurring_monthly" in det.columns else 0,
-                            factor.at[i],
-                        )
-                        for i in det.index
-                    ]
+                start_s = det["start_date"] if "start_date" in det.columns else det["first_contract_date"]
+                start_s = start_s.fillna(det["first_contract_date"])
+                end_s = det["end_date"] if "end_date" in det.columns else pd.Series(pd.NaT, index=det.index)
+                mrr = pd.to_numeric(det.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
+                det["meses_contrato"] = [contract_months(s, e) for s, e in zip(start_s, end_s)]
+                det["valor_vendido"] = [
+                    valor_vendido_contrato(m, s, e) for m, s, e in zip(mrr, start_s, end_s)
+                ]
                 cols = [c for c in [
-                    "name", "cliente", "first_contract_date", "mes", "plan", "periodo_plan",
-                    "subscription_state", "moneda", "recurring_monthly", "recurring_total",
-                    "amount_untaxed", "valor_cierre", "equipo",
+                    "name", "cliente", "first_contract_date", "mes",
+                    "start_date", "end_date", "meses_contrato",
+                    "recurring_monthly", "valor_vendido", "plan", "equipo",
                 ] if c in det.columns]
                 st.caption(
-                    "Contratos nuevos por Fecha del primer contrato. "
-                    "Valor = `recurring_total` o MRR × período del plan "
-                    f"(8M×3=24M; 14M×1=14M). Suma: {fmt_money(staff_cierre_anual)}."
+                    "En la **fecha del primer contrato**: Valor vendido = "
+                    "**MRR × meses** (desde inicio hasta fin del contrato). "
+                    "Ej. 8M × 3 meses = 24M. Sin fecha fin = 1 mes. "
+                    f"Suma del período: {fmt_money(staff_cierre_anual)}."
                 )
                 st.dataframe(
                     det[cols].sort_values("first_contract_date"),
                     use_container_width=True, hide_index=True,
                     column_config={
-                        "recurring_monthly": st.column_config.NumberColumn("MRR", format="%,.0f"),
-                        "recurring_total": st.column_config.NumberColumn("Total período", format="%,.0f"),
-                        "amount_untaxed": st.column_config.NumberColumn("S/imp.", format="%,.0f"),
-                        "valor_cierre": st.column_config.NumberColumn("Valor cierre", format="%,.0f"),
-                        "periodo_plan": st.column_config.NumberColumn("Meses plan", format="%.0f"),
+                        "recurring_monthly": st.column_config.NumberColumn("MRR / mes", format="%,.0f"),
+                        "meses_contrato": st.column_config.NumberColumn("Meses", format="%d"),
+                        "valor_vendido": st.column_config.NumberColumn("Vendido", format="%,.0f"),
                     },
                 )
             else:
-                st.caption("Sin suscripciones Staff que cumplan el filtro de cierre.")
+                st.caption("Sin suscripciones Staff en el filtro de cierre.")
+
         with st.expander("Detalle OV Staff (referencia: amount_untaxed de 1 período)"):
             s = k.get("sales_ov")
             if s is None or s.empty:
@@ -761,7 +752,7 @@ with tab_resumen:
         f"**Vendido Staff (KPI):** valor suscripción × plan recurrente "
         f"(Recurrente × meses vigentes; `{staff_vendido_fuente}`). "
         f"**Cierre Staff (contratos nuevos):** {fmt_money(staff_cierre_anual)} = "
-        f"MRR × período del plan (`sale.order.log.report`). "
+        f"MRR × meses del contrato (fecha primer contrato). "
         f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {periodo_label} · "
         f"Confirmado · Importe sin impuestos. "
         f"**Facturado:** `account.move.line` publicadas · tipo **product** · "
