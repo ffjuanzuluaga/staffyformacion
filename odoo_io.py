@@ -1029,8 +1029,8 @@ def load_subscriptions(team_id: int | None):
     wanted = [
         "name", "partner_id", "subscription_state", "start_date", "end_date",
         "first_contract_date", "origin_order_id", "team_id", "next_invoice_date",
-        "recurring_monthly", "plan_id", "staff_request_id", "user_id", "amount_untaxed",
-        "currency_id", "currency_rate",
+        "recurring_monthly", "recurring_total", "plan_id", "staff_request_id", "user_id",
+        "amount_untaxed", "currency_id", "currency_rate",
     ]
     have = available_fields("sale.order")
     domain = []
@@ -1097,7 +1097,7 @@ def load_subscriptions(team_id: int | None):
 @st.cache_data(ttl=600, show_spinner="Cargando log de suscripciones (MRR / renovaciones)...")
 def load_subscription_logs(date_from: str, date_to: str, team_ids: list[int]):
     cols = ["event_type", "event_date", "order_id", "team_id", "amount_signed",
-            "recurring_monthly", "subscription_state"]
+            "recurring_monthly", "subscription_state", "plan_id"]
     if "sale.order.log" not in _models_exist(("sale.order.log",)):
         return pd.DataFrame(columns=cols), None
     domain = [
@@ -1116,7 +1116,90 @@ def load_subscription_logs(date_from: str, date_to: str, team_ids: list[int]):
     df["mes"] = df["event_date"].dt.to_period("M").astype(str)
     df["suscripcion"] = m2o_name(df["order_id"]) if "order_id" in df else ""
     df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
+    df["equipo_id"] = m2o_id(df["team_id"]) if "team_id" in df else None
+    df["plan"] = m2o_name(df["plan_id"]) if "plan_id" in df else ""
+    df["plan_id_num"] = m2o_id(df["plan_id"]) if "plan_id" in df else None
     return df, None
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando MRR Breakdown (sale.order.log.report)...")
+def load_sale_order_log_report(date_from: str, date_to: str, team_ids: list[int]):
+    """Fuente de cierre alineada a Odoo → Suscripciones → MRR Breakdown.
+
+    Preferimos `sale.order.log.report` (SQL view). Fallback: `sale.order.log`.
+    """
+    cols = [
+        "event_type", "event_date", "first_contract_date", "order_id", "origin_order_id",
+        "team_id", "plan_id", "amount_signed", "recurring_monthly", "subscription_state",
+    ]
+    model = None
+    existing = _models_exist(("sale.order.log.report", "sale.order.log"))
+    if "sale.order.log.report" in existing:
+        model = "sale.order.log.report"
+    elif "sale.order.log" in existing:
+        model = "sale.order.log"
+    else:
+        return pd.DataFrame(columns=cols), None
+
+    # Cargamos por event_date (siempre en el log); el mes de cierre usa first_contract_date.
+    have = available_fields(model)
+    domain = [
+        ("event_date", ">=", date_from),
+        ("event_date", "<=", date_to),
+        ("event_type", "=", "0_creation"),
+    ]
+    if team_ids and "team_id" in have:
+        domain.append(("team_id", "in", team_ids))
+    try:
+        df = search_read(model, domain, pick_fields(model, cols))
+    except Exception as e:
+        return pd.DataFrame(columns=cols), f"No se pudo leer {model}: {e}"
+    if df.empty:
+        return df, None
+    df["event_date"] = pd.to_datetime(df.get("event_date"), errors="coerce")
+    if "first_contract_date" in df.columns:
+        df["first_contract_date"] = pd.to_datetime(df["first_contract_date"], errors="coerce")
+    else:
+        df["first_contract_date"] = pd.NaT
+    df["suscripcion"] = m2o_name(df["order_id"]) if "order_id" in df else ""
+    df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
+    df["equipo_id"] = m2o_id(df["team_id"]) if "team_id" in df else None
+    df["plan"] = m2o_name(df["plan_id"]) if "plan_id" in df else ""
+    df["plan_id_num"] = m2o_id(df["plan_id"]) if "plan_id" in df else None
+    df["_model"] = model
+    return df, None
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando planes de suscripción...")
+def load_subscription_plans() -> pd.DataFrame:
+    if "sale.subscription.plan" not in _models_exist(("sale.subscription.plan",)):
+        return pd.DataFrame(columns=["id", "name", "billing_period_value", "billing_period_unit"])
+    cols = ["name", "billing_period_value", "billing_period_unit"]
+    try:
+        df = search_read("sale.subscription.plan", [], pick_fields("sale.subscription.plan", cols))
+    except Exception:
+        return pd.DataFrame(columns=["id", "name", "billing_period_value", "billing_period_unit"])
+    if df.empty:
+        return df
+    df["billing_period_value"] = pd.to_numeric(df.get("billing_period_value", 1), errors="coerce").fillna(1.0)
+    df["billing_period_unit"] = df.get("billing_period_unit", "month").fillna("month").astype(str)
+    return df
+
+
+def plan_period_months(value, unit) -> float:
+    """Meses equivalentes del período de facturación del plan (Odoo INTERVAL_FACTOR inverso)."""
+    try:
+        v = float(value) if value is not None and not pd.isna(value) else 1.0
+    except (TypeError, ValueError):
+        v = 1.0
+    unit = (unit or "month").lower()
+    if unit == "year":
+        return v * 12.0
+    if unit == "week":
+        return v * 7.0 / 30.437
+    if unit == "day":
+        return v / 30.437
+    return max(v, 1.0)  # month (default)
 
 
 def staffing_coverage(df: pd.DataFrame, months: list[str],
@@ -1210,14 +1293,98 @@ def _subscription_cierre_frame(subs: pd.DataFrame, team_id: int | None = None) -
     return sub.drop(columns=["_chain", "_rank"], errors="ignore")
 
 
-def subscription_cierre_monthly(subs: pd.DataFrame, months: list[str],
-                                team_id: int | None = None) -> pd.DataFrame:
-    """Cierre Staff = Σ (Recurrente × meses de vigencia) en el mes de first_contract_date.
+def log_cierre_monthly(logs: pd.DataFrame, months: list[str],
+                         team_id: int | None = None,
+                         plans: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Cierre desde sale.order.log(.report): eventos New (0_creation).
 
-    Ej.: suscripción 8M/mes por 3 meses → 24M en el mes del primer contrato.
-    Sin end_date se cuenta 1 mes (solo el MRR).
+    Valor = amount_signed (MRR change del log) × meses del plan de facturación.
+    Así un plan trimestral (MRR 8M, período 3) aporta 24M; un plan mensual
+    (MRR 14M) aporta 14M aunque la vigencia calendario sea más larga.
+    Igual que el importe de un período (`recurring_total`) en Odoo.
     """
-    fuente = "sale.order · first_contract_date + Recurrente × meses vigencia"
+    model = "sale.order.log.report"
+    if logs is not None and not logs.empty and "_model" in logs.columns:
+        model = str(logs["_model"].iloc[0])
+    fuente = f"{model} · New · amount_signed × período del plan"
+    if not months:
+        return pd.DataFrame(columns=["mes", "vendido", "fuente"])
+    empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
+                          "fuente": [fuente] * len(months)})
+    if logs is None or logs.empty:
+        return empty
+    df = logs.copy()
+    if team_id is not None and "equipo_id" in df.columns:
+        df = df[pd.to_numeric(df["equipo_id"], errors="coerce") == int(team_id)]
+    if "event_type" in df.columns:
+        df = df[df["event_type"] == "0_creation"]
+    if df.empty:
+        return empty
+
+    # Mes del cierre = first_contract_date (como el reporte Odoo); fallback event_date.
+    if "first_contract_date" in df.columns and df["first_contract_date"].notna().any():
+        df["_mes_src"] = df["first_contract_date"].fillna(df.get("event_date"))
+    else:
+        df["_mes_src"] = df["event_date"]
+    df = df[df["_mes_src"].notna()].copy()
+    if df.empty:
+        return empty
+    df["mes"] = pd.to_datetime(df["_mes_src"]).dt.to_period("M").astype(str)
+
+    amount = pd.to_numeric(df.get("amount_signed", 0), errors="coerce").fillna(0.0)
+    mrr_log = pd.to_numeric(df.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
+    factor = pd.Series(1.0, index=df.index)
+    if plans is not None and not plans.empty and "plan_id_num" in df.columns:
+        plan_map = plans.set_index("id") if "id" in plans.columns else None
+        if plan_map is not None:
+            for idx, pid in df["plan_id_num"].items():
+                if pd.isna(pid):
+                    continue
+                try:
+                    pid_i = int(pid)
+                except (TypeError, ValueError):
+                    continue
+                if pid_i not in plan_map.index:
+                    continue
+                row = plan_map.loc[pid_i]
+                if isinstance(row, pd.DataFrame):
+                    row = row.iloc[0]
+                factor.loc[idx] = plan_period_months(
+                    row.get("billing_period_value", 1),
+                    row.get("billing_period_unit", "month"),
+                )
+    # Estándar Odoo: amount_signed (creación) = MRR → × período del plan = recurring_total.
+    # Si amount_signed ya ≈ MRR×plan, no remultiplicar (evita 24×3).
+    valores = []
+    for a, m, f in zip(amount, mrr_log, factor):
+        f = float(f) if f else 1.0
+        if f <= 1.01:
+            valores.append(float(a))
+            continue
+        periodo = (m if m else a) * f
+        if m > 0 and abs(a - m) / max(abs(m), 1.0) < 0.08:
+            valores.append(float(a) * f)  # amount es MRR
+        elif abs(a - periodo) / max(abs(periodo), 1.0) < 0.08:
+            valores.append(float(a))  # amount ya es total del período
+        else:
+            valores.append(float(a) * f)
+    df["_valor"] = valores
+    por_mes = df.groupby("mes", as_index=False)["_valor"].sum().rename(columns={"_valor": "vendido"})
+    out = pd.DataFrame({"mes": months}).merge(por_mes, on="mes", how="left")
+    out["vendido"] = out["vendido"].fillna(0.0)
+    out["fuente"] = fuente
+    return out
+
+
+def subscription_cierre_monthly(subs: pd.DataFrame, months: list[str],
+                                team_id: int | None = None,
+                                plans: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Fallback sin logs: importe de un período del plan por first_contract_date.
+
+    Preferimos `recurring_total` (= price_subtotal del período en Odoo).
+    Si no está: recurring_monthly × meses del plan (no de start→end).
+    """
+    fuente = "sale.order · first_contract_date + recurring_total (período del plan)"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -1228,15 +1395,36 @@ def subscription_cierre_monthly(subs: pd.DataFrame, months: list[str],
 
     sub = sub.copy()
     sub["mes"] = sub["first_contract_date"].dt.to_period("M").astype(str)
-    start = sub["start_date"] if "start_date" in sub.columns else sub["first_contract_date"]
-    if "first_contract_date" in sub.columns:
-        start = start.fillna(sub["first_contract_date"])
-    end = sub["end_date"] if "end_date" in sub.columns else pd.Series(pd.NaT, index=sub.index)
-    sub["_mrr"] = pd.to_numeric(sub.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
-    sub["_meses"] = [
-        _duration_months(s, e) for s, e in zip(start, end)
-    ]
-    sub["_valor"] = sub["_mrr"] * sub["_meses"]
+    total = pd.to_numeric(sub.get("recurring_total", 0), errors="coerce")
+    untaxed = pd.to_numeric(sub.get("amount_untaxed", 0), errors="coerce")
+    mrr = pd.to_numeric(sub.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
+
+    factor = pd.Series(1.0, index=sub.index)
+    if plans is not None and not plans.empty and "plan_id" in sub.columns:
+        plan_ids = m2o_id(sub["plan_id"]) if not pd.api.types.is_numeric_dtype(sub["plan_id"]) else pd.to_numeric(sub["plan_id"], errors="coerce")
+        plan_map = plans.set_index("id") if "id" in plans.columns else None
+        if plan_map is not None:
+            for idx, pid in plan_ids.items():
+                if pd.isna(pid):
+                    continue
+                try:
+                    pid_i = int(pid)
+                except (TypeError, ValueError):
+                    continue
+                if pid_i not in plan_map.index:
+                    continue
+                row = plan_map.loc[pid_i]
+                if isinstance(row, pd.DataFrame):
+                    row = row.iloc[0]
+                factor.loc[idx] = plan_period_months(
+                    row.get("billing_period_value", 1),
+                    row.get("billing_period_unit", "month"),
+                )
+
+    # recurring_total / amount_untaxed ya son el importe del período.
+    valor = total.where(total.notna() & (total > 0), untaxed)
+    valor = valor.where(valor.notna() & (valor > 0), mrr * factor)
+    sub["_valor"] = valor.fillna(0.0)
     por_mes = sub.groupby("mes", as_index=False)["_valor"].sum().rename(columns={"_valor": "vendido"})
     out = pd.DataFrame({"mes": months}).merge(por_mes, on="mes", how="left")
     out["vendido"] = out["vendido"].fillna(0.0)
@@ -1245,8 +1433,8 @@ def subscription_cierre_monthly(subs: pd.DataFrame, months: list[str],
 
 
 def staffing_cierre_monthly(requests: pd.DataFrame, months: list[str]) -> pd.DataFrame:
-    """Fallback: valor mensual × meses de vigencia en el mes de date_start."""
-    fuente = "firefly.staffing.request · date_start × meses vigencia"
+    """Fallback sin suscripciones: valor mensual de la plaza en el mes de date_start."""
+    fuente = "firefly.staffing.request · date_start (valor mensual)"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -1263,12 +1451,7 @@ def staffing_cierre_monthly(requests: pd.DataFrame, months: list[str]) -> pd.Dat
     usable["_mrr"] = pd.to_numeric(
         usable.get("monthly_amount_company_currency", 0), errors="coerce"
     ).fillna(0.0)
-    end = usable["date_end"] if "date_end" in usable.columns else pd.Series(pd.NaT, index=usable.index)
-    usable["_meses"] = [
-        _duration_months(s, e) for s, e in zip(usable["date_start"], end)
-    ]
-    usable["_valor"] = usable["_mrr"] * usable["_meses"]
-    por_mes = usable.groupby("mes", as_index=False)["_valor"].sum().rename(columns={"_valor": "vendido"})
+    por_mes = usable.groupby("mes", as_index=False)["_mrr"].sum().rename(columns={"_mrr": "vendido"})
     out = pd.DataFrame({"mes": months}).merge(por_mes, on="mes", how="left")
     out["vendido"] = out["vendido"].fillna(0.0)
     out["fuente"] = fuente
@@ -1276,10 +1459,16 @@ def staffing_cierre_monthly(requests: pd.DataFrame, months: list[str]) -> pd.Dat
 
 
 def staff_cierre_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | None,
-                         months: list[str], team_id: int | None = None) -> pd.DataFrame:
-    """Cierre comercial: valor contrato (MRR × meses) por Fecha del primer contrato."""
+                         months: list[str], team_id: int | None = None,
+                         logs: pd.DataFrame | None = None,
+                         plans: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Cierre comercial: sale.order.log.report (New) → fallback suscripciones → staffing."""
+    if logs is not None and not logs.empty:
+        out = log_cierre_monthly(logs, months, team_id=team_id, plans=plans)
+        if out["vendido"].sum() > 0:
+            return out
     if subs is not None and not subs.empty:
-        return subscription_cierre_monthly(subs, months, team_id=team_id)
+        return subscription_cierre_monthly(subs, months, team_id=team_id, plans=plans)
     return staffing_cierre_monthly(
         requests if requests is not None else pd.DataFrame(), months
     )

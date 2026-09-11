@@ -35,12 +35,15 @@ from odoo_io import (
     load_sales_team_employees,
     load_staffing_renewals,
     load_staffing_requests,
+    load_sale_order_log_report,
     load_subscription_logs,
+    load_subscription_plans,
     load_subscriptions,
     load_team_activities,
     load_teams,
     load_won,
     month_list,
+    plan_period_months,
     resolve_linea_teams,
     staff_cierre_detail,
     staff_cierre_monthly,
@@ -87,19 +90,6 @@ def months_between(d1, d2) -> list[str]:
     if p2 < p1:
         p1, p2 = p2, p1
     return [str(p1 + i) for i in range((p2 - p1).n + 1)]
-
-
-def _duration_months(start, end) -> int:
-    """Meses de vigencia inclusivos (start→end). Sin fin → 1."""
-    if pd.isna(start):
-        return 1
-    start_p = pd.Period(start, freq="M")
-    if pd.isna(end):
-        return 1
-    end_p = pd.Period(end, freq="M")
-    if end_p < start_p:
-        return 1
-    return int((end_p - start_p).n) + 1
 
 
 def fmt_money(v: float) -> str:
@@ -327,14 +317,18 @@ staff_team_id = team_id_for_linea(teams_df, "Staff")
 subs_df, err_subs = load_subscriptions(staff_team_id)
 renewals, err_ren = load_staffing_renewals(d1, d2)
 sub_logs, err_logs = load_subscription_logs(d1, d2, team_ids)
+mrr_report, err_mrr_report = load_sale_order_log_report(d1, d2, team_ids)
+sub_plans = load_subscription_plans()
 projects, err_proj = load_projects(d1, d2)
 
-# Staff: KPI anual = total con recurrencia; gráfico = cierre por primer contrato.
+# Staff: KPI = recurrencia; gráfico cierre = sale.order.log.report (New × plan).
 staff_recurrente_mes = staff_recurrente_monthly(
     staff_req, subs_df, months_year, team_id=staff_team_id
 )
 staff_cierre_mes = staff_cierre_monthly(
-    staff_req, subs_df, months_year, team_id=staff_team_id
+    staff_req, subs_df, months_year, team_id=staff_team_id,
+    logs=mrr_report if mrr_report is not None and not mrr_report.empty else sub_logs,
+    plans=sub_plans,
 )
 staff_vendido_anual = (
     float(staff_recurrente_mes["vendido"].sum()) if not staff_recurrente_mes.empty else 0.0
@@ -421,7 +415,7 @@ def chart_venta_vs_meta(linea: str, sales: pd.DataFrame):
     meta_m = meta_anual_de(metas_lineas, linea) / 12
     if linea == "Staff":
         scol = STAFF_VENDIDO_COL
-        titulo = f"{linea} — cierre (Recurrente × meses) vs. meta mensual ({periodo_label})"
+        titulo = f"{linea} — cierre MRR (sale.order.log.report) vs. meta mensual ({periodo_label})"
         ventas_mes = (
             sales.groupby("mes", as_index=False)[scol].sum()
             if sales is not None and not sales.empty and scol in sales
@@ -568,9 +562,9 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
             f"**Vendido Staff (KPI de arriba)** = valor mensual de la plaza × meses vigentes "
             f"(equivalente a suscripción × plan mensual; fuente: `{staff_vendido_fuente}`). "
             f"Hoy: {fmt_money(staff_vendido_anual)}. "
-            f"**Cierre del período** (contratos nuevos: Recurrente × meses de vigencia): "
+            f"**Cierre del período** (New en `sale.order.log.report`: MRR × período del plan): "
             f"{fmt_money(staff_cierre_anual)} (`{staff_cierre_fuente}`). "
-            f"El gráfico de abajo es el **cierre mes a mes** (p. ej. 8M × 3 meses = 24M). "
+            f"Ej.: plan trimestral 8M → 24M; plan mensual 14M → 14M (no × vigencia). "
             f"**Facturado** = líneas de asiento `display_type=product` (−`balance` COP)."
         )
     else:
@@ -601,7 +595,7 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                 f"Suma anual (KPI de arriba): {fmt_money(staff_vendido_anual)}. "
                 "Con plan mensual: cada mes vigente suma el Recurrente de la suscripción."
             )
-        with st.expander("Detalle cierre Staff (Recurrente × meses — gráfico mes a mes)"):
+        with st.expander("Detalle cierre Staff (sale.order.log.report — gráfico mes a mes)"):
             st.dataframe(
                 staff_cierre_mes,
                 use_container_width=True, hide_index=True,
@@ -611,41 +605,100 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                     "fuente": "Fuente",
                 },
             )
-            det = staff_cierre_detail(subs_df, team_id=staff_team_id)
-            if det is not None and not det.empty:
-                det = det.copy()
-                det["mes"] = det["first_contract_date"].dt.to_period("M").astype(str)
-                det = det[det["mes"].isin(months_year)]
-                start = det["start_date"] if "start_date" in det.columns else det["first_contract_date"]
+            # Preferir filas New del MRR report; fallback detalle de suscripciones.
+            log_src = mrr_report if mrr_report is not None and not mrr_report.empty else sub_logs
+            if log_src is not None and not log_src.empty and "event_type" in log_src.columns:
+                det = log_src[log_src["event_type"] == "0_creation"].copy()
+                if staff_team_id is not None and "equipo_id" in det.columns:
+                    det = det[pd.to_numeric(det["equipo_id"], errors="coerce") == int(staff_team_id)]
                 if "first_contract_date" in det.columns:
-                    start = start.fillna(det["first_contract_date"])
-                end = det["end_date"] if "end_date" in det.columns else pd.Series(pd.NaT, index=det.index)
-                det["meses_vigencia"] = [_duration_months(s, e) for s, e in zip(start, end)]
-                det["valor_contrato"] = (
-                    pd.to_numeric(det.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
-                    * det["meses_vigencia"]
-                )
+                    det["_mes_src"] = det["first_contract_date"].fillna(det.get("event_date"))
+                else:
+                    det["_mes_src"] = det["event_date"]
+                det = det[det["_mes_src"].notna()].copy()
+                det["mes"] = pd.to_datetime(det["_mes_src"]).dt.to_period("M").astype(str)
+                det = det[det["mes"].isin(months_year)]
+                # Período del plan
+                plan_map = sub_plans.set_index("id") if sub_plans is not None and not sub_plans.empty and "id" in sub_plans.columns else None
+                factors, periodos = [], []
+                for _, row in det.iterrows():
+                    f = 1.0
+                    pid = row.get("plan_id_num")
+                    if plan_map is not None and pd.notna(pid):
+                        try:
+                            pid_i = int(pid)
+                            if pid_i in plan_map.index:
+                                prow = plan_map.loc[pid_i]
+                                if isinstance(prow, pd.DataFrame):
+                                    prow = prow.iloc[0]
+                                f = plan_period_months(prow.get("billing_period_value", 1), prow.get("billing_period_unit", "month"))
+                        except (TypeError, ValueError):
+                            pass
+                    factors.append(f)
+                    periodos.append(
+                        "trimestral" if abs(f - 3) < 0.01 else ("mensual" if abs(f - 1) < 0.01 else f"{f:g} meses")
+                    )
+                det["periodo_plan"] = periodos
+                amt = pd.to_numeric(det.get("amount_signed", 0), errors="coerce").fillna(0.0)
+                mrr = pd.to_numeric(det.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
+                vals = []
+                for a, m, f in zip(amt, mrr, factors):
+                    if f <= 1.01:
+                        vals.append(float(a))
+                    elif m > 0 and abs(a - m) / max(abs(m), 1.0) < 0.08:
+                        vals.append(float(a) * f)
+                    elif abs(a - (m if m else a) * f) / max(abs((m if m else a) * f), 1.0) < 0.08:
+                        vals.append(float(a))
+                    else:
+                        vals.append(float(a) * f)
+                det["valor_cierre"] = vals
                 cols = [c for c in [
-                    "name", "cliente", "first_contract_date", "mes", "start_date", "end_date",
-                    "meses_vigencia", "subscription_state", "moneda", "recurring_monthly",
-                    "valor_contrato", "equipo",
+                    "suscripcion", "event_date", "first_contract_date", "mes", "event_type",
+                    "plan", "periodo_plan", "amount_signed", "recurring_monthly", "valor_cierre", "equipo",
                 ] if c in det.columns]
                 if cols:
                     st.caption(
-                        "Contratos nuevos del período (Recurrente × meses start→end). "
+                        "Eventos **New** de `sale.order.log.report` (MRR × período del plan, "
+                        "no × vigencia start→end). "
+                        f"Suma cierre período: {fmt_money(staff_cierre_anual)}."
+                    )
+                    st.dataframe(
+                        det[cols].sort_values("event_date" if "event_date" in cols else cols[0]),
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "amount_signed": st.column_config.NumberColumn("MRR change", format="%,.0f"),
+                            "recurring_monthly": st.column_config.NumberColumn("New MRR", format="%,.0f"),
+                            "valor_cierre": st.column_config.NumberColumn("Valor cierre", format="%,.0f"),
+                        },
+                    )
+                else:
+                    st.caption("Sin eventos New en el período.")
+            else:
+                det = staff_cierre_detail(subs_df, team_id=staff_team_id)
+                if det is not None and not det.empty:
+                    det = det.copy()
+                    det["mes"] = det["first_contract_date"].dt.to_period("M").astype(str)
+                    det = det[det["mes"].isin(months_year)]
+                    cols = [c for c in [
+                        "name", "cliente", "first_contract_date", "mes", "plan",
+                        "subscription_state", "moneda", "recurring_monthly", "recurring_total",
+                        "amount_untaxed", "equipo",
+                    ] if c in det.columns]
+                    st.caption(
+                        "Fallback sin log.report: `recurring_total` / untaxed del período del plan. "
                         f"Suma cierre período: {fmt_money(staff_cierre_anual)}."
                     )
                     st.dataframe(
                         det[cols].sort_values("first_contract_date"),
                         use_container_width=True, hide_index=True,
                         column_config={
-                            "recurring_monthly": st.column_config.NumberColumn("Recurrente", format="%,.0f"),
-                            "meses_vigencia": st.column_config.NumberColumn("Meses", format="%d"),
-                            "valor_contrato": st.column_config.NumberColumn("Valor contrato", format="%,.0f"),
+                            "recurring_monthly": st.column_config.NumberColumn("MRR", format="%,.0f"),
+                            "recurring_total": st.column_config.NumberColumn("Total período", format="%,.0f"),
+                            "amount_untaxed": st.column_config.NumberColumn("S/imp.", format="%,.0f"),
                         },
                     )
-            else:
-                st.caption("Sin suscripciones Staff que cumplan el filtro de cierre.")
+                else:
+                    st.caption("Sin suscripciones Staff que cumplan el filtro de cierre.")
         with st.expander("Detalle OV Staff (referencia: amount_untaxed de 1 período)"):
             s = k.get("sales_ov")
             if s is None or s.empty:
@@ -751,7 +804,7 @@ with tab_resumen:
         f"**Vendido Staff (KPI):** valor suscripción × plan recurrente "
         f"(Recurrente × meses vigentes; `{staff_vendido_fuente}`). "
         f"**Cierre Staff (contratos nuevos):** {fmt_money(staff_cierre_anual)} = "
-        f"Recurrente × meses de vigencia. "
+        f"MRR × período del plan (`sale.order.log.report`). "
         f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {periodo_label} · "
         f"Confirmado · Importe sin impuestos. "
         f"**Facturado:** `account.move.line` publicadas · tipo **product** · "
