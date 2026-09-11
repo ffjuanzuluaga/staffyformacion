@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Cierre Staff alineado a sale.order.log.report (MRR Breakdown de Odoo).
+"""Cierre Staff: importe de un período del plan por Fecha del primer contrato.
 
-Valor de cierre = importe de **un período de facturación** del plan:
-  - Preferir `sale.order.recurring_total` (lo que Odoo cobra por período).
-  - Si no: `amount_signed` (MRR del log) × `billing_period` del plan.
-  - Nunca × vigencia calendario start→end.
+Fuente principal: suscripciones (sale.order) — estable mes a mes.
+Apoyo: sale.order.log.report (eventos New) para detalle / cruce.
+
+Valor por contrato:
+  1) recurring_total (importe del período en Odoo)
+  2) recurring_monthly × billing_period del plan
+  3) amount_untaxed
+Nunca × vigencia calendario start→end.
 """
 
 from __future__ import annotations
@@ -27,7 +31,6 @@ from odoo_io import (
 
 
 def plan_period_months(value, unit) -> float:
-    """Meses equivalentes del período de facturación del plan."""
     try:
         v = float(value) if value is not None and not pd.isna(value) else 1.0
     except (TypeError, ValueError):
@@ -43,7 +46,6 @@ def plan_period_months(value, unit) -> float:
 
 
 def _period_months_from_plan_name(name) -> float | None:
-    """Fallback si no hay plan_id: '3 Months', 'Trimestral', 'Mensual', etc."""
     if name is None or (isinstance(name, float) and pd.isna(name)):
         return None
     s = str(name).strip().lower()
@@ -51,25 +53,21 @@ def _period_months_from_plan_name(name) -> float | None:
         return None
     if "trimestr" in s or "quarter" in s:
         return 3.0
-    if "semestr" in s or "semester" in s or "semi" in s:
+    if "semestr" in s or "semester" in s:
         return 6.0
-    if "anual" in s or "annual" in s or "yearly" in s or "year" in s:
+    if "anual" in s or "annual" in s or "yearly" in s:
         return 12.0
-    if "mensual" in s or "month" in s or "monthly" in s:
-        # "3 months" / "2 months"
-        m = re.search(r"(\d+)\s*m", s)
-        if m:
-            return float(m.group(1))
-        return 1.0
     m = re.search(r"(\d+)\s*(mes|month)", s)
     if m:
         return float(m.group(1))
+    if "mensual" in s or "monthly" in s or re.search(r"\bmonth\b", s):
+        return 1.0
     return None
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando MRR Breakdown (sale.order.log.report)...")
 def load_sale_order_log_report(date_from: str, date_to: str, team_ids: list[int]):
-    """Fuente de cierre: sale.order.log.report (fallback sale.order.log)."""
+    """Detalle New desde sale.order.log.report (fallback sale.order.log)."""
     cols = [
         "event_type", "event_date", "first_contract_date", "order_id", "origin_order_id",
         "team_id", "plan_id", "amount_signed", "recurring_monthly", "subscription_state",
@@ -83,13 +81,12 @@ def load_sale_order_log_report(date_from: str, date_to: str, team_ids: list[int]
         return pd.DataFrame(columns=cols), None
 
     have = available_fields(model)
-    # No filtrar plan_id con pick_fields si fields_get del SQL view es incompleto:
-    # pedimos wanted y dejamos que Odoo ignore lo que no exista.
-    fields = pick_fields(model, cols) if have else cols
-    for must in ("event_type", "event_date", "order_id", "amount_signed", "team_id", "plan_id"):
-        if must not in fields and (not have or must in have or must == "plan_id"):
-            if must not in fields:
-                fields.append(must)
+    fields = list(pick_fields(model, cols) if have else cols)
+    for must in ("event_type", "event_date", "order_id", "amount_signed", "team_id"):
+        if must not in fields:
+            fields.append(must)
+    if "plan_id" not in fields:
+        fields.append("plan_id")
 
     domain = [
         ("event_date", ">=", date_from),
@@ -101,7 +98,6 @@ def load_sale_order_log_report(date_from: str, date_to: str, team_ids: list[int]
     try:
         df = search_read(model, domain, fields)
     except Exception:
-        # Reintento sin plan_id / first_contract_date (campos que a veces fallan en la view).
         fields_min = [f for f in fields if f not in ("plan_id", "first_contract_date", "origin_order_id")]
         try:
             df = search_read(model, domain, fields_min)
@@ -133,81 +129,11 @@ def load_subscription_plans() -> pd.DataFrame:
         df = search_read("sale.subscription.plan", [], pick_fields("sale.subscription.plan", cols))
     except Exception:
         return pd.DataFrame(columns=["id", "name", "billing_period_value", "billing_period_unit"])
-    if df.empty:
-        return df
-    if "id" not in df.columns:
+    if df.empty or "id" not in df.columns:
         return pd.DataFrame(columns=["id", "name", "billing_period_value", "billing_period_unit"])
     df["id"] = pd.to_numeric(df["id"], errors="coerce")
     df["billing_period_value"] = pd.to_numeric(df.get("billing_period_value", 1), errors="coerce").fillna(1.0)
     df["billing_period_unit"] = df.get("billing_period_unit", "month").fillna("month").astype(str)
-    return df
-
-
-def _enrich_logs_from_subs(df: pd.DataFrame, subs: pd.DataFrame | None) -> pd.DataFrame:
-    """Completa plan_id / recurring_total / amount_untaxed desde sale.order."""
-    if subs is None or subs.empty or "order_id_num" not in df.columns:
-        return df
-    sub = subs.copy()
-    if "id" not in sub.columns:
-        return df
-    sub["id"] = pd.to_numeric(sub["id"], errors="coerce")
-    sub = sub[sub["id"].notna()].drop_duplicates(subset=["id"], keep="first")
-    sub = sub.set_index("id")
-
-    order_ids = pd.to_numeric(df["order_id_num"], errors="coerce")
-
-    def _lookup(oid, col, default=None):
-        if pd.isna(oid) or oid not in sub.index:
-            return default
-        row = sub.loc[oid]
-        if isinstance(row, pd.DataFrame):
-            row = row.iloc[0]
-        return row.get(col, default)
-
-    if "recurring_total" not in df.columns:
-        df["recurring_total"] = [ _lookup(oid, "recurring_total", 0) for oid in order_ids ]
-    if "amount_untaxed" not in df.columns:
-        df["amount_untaxed"] = [ _lookup(oid, "amount_untaxed", 0) for oid in order_ids ]
-
-    # plan_id del pedido si el log no lo trae
-    plan_from_so = []
-    plan_name_from_so = []
-    for oid in order_ids:
-        if pd.isna(oid) or oid not in sub.index:
-            plan_from_so.append(None)
-            plan_name_from_so.append("")
-            continue
-        row = sub.loc[oid]
-        if isinstance(row, pd.DataFrame):
-            row = row.iloc[0]
-        pid = row.get("plan_id")
-        # plan_id puede ser m2o [id, name] o ya numérico
-        if isinstance(pid, (list, tuple)) and pid:
-            try:
-                plan_from_so.append(int(pid[0]))
-            except (TypeError, ValueError):
-                plan_from_so.append(None)
-            plan_name_from_so.append(str(pid[1]) if len(pid) > 1 else "")
-        else:
-            try:
-                plan_from_so.append(int(pid) if pd.notna(pid) else None)
-            except (TypeError, ValueError):
-                plan_from_so.append(None)
-            plan_name_from_so.append(str(row.get("plan", "") or ""))
-
-    if "plan_id_num" not in df.columns:
-        df["plan_id_num"] = plan_from_so
-    else:
-        df["plan_id_num"] = pd.to_numeric(df["plan_id_num"], errors="coerce")
-        missing = df["plan_id_num"].isna()
-        df.loc[missing, "plan_id_num"] = pd.Series(plan_from_so, index=df.index)[missing]
-
-    if "plan" not in df.columns or df["plan"].fillna("").eq("").all() or (df["plan"] == "Sin asignar").all():
-        df["plan"] = plan_name_from_so
-    else:
-        blank = df["plan"].isna() | df["plan"].astype(str).isin(["", "Sin asignar", "False"])
-        df.loc[blank, "plan"] = pd.Series(plan_name_from_so, index=df.index)[blank]
-
     return df
 
 
@@ -217,14 +143,14 @@ def _plan_factor_series(df: pd.DataFrame, plans: pd.DataFrame | None) -> pd.Seri
     if plans is not None and not plans.empty and "id" in plans.columns:
         p = plans.copy()
         p["id"] = pd.to_numeric(p["id"], errors="coerce")
-        plan_map = p[p["id"].notna()].set_index("id")
+        plan_map = p[p["id"].notna()].drop_duplicates(subset=["id"]).set_index("id")
 
     for idx in df.index:
         f = None
         pid = df.at[idx, "plan_id_num"] if "plan_id_num" in df.columns else None
         if plan_map is not None and pd.notna(pid):
             try:
-                pid_i = int(pid)
+                pid_i = int(float(pid))
             except (TypeError, ValueError):
                 pid_i = None
             if pid_i is not None and pid_i in plan_map.index:
@@ -241,49 +167,94 @@ def _plan_factor_series(df: pd.DataFrame, plans: pd.DataFrame | None) -> pd.Seri
     return factor
 
 
-def _valores_cierre(df: pd.DataFrame, factor: pd.Series) -> list[float]:
-    """Prioridad: recurring_total → amount_untaxed → amount_signed × plan."""
-    total = pd.to_numeric(df.get("recurring_total", 0), errors="coerce")
-    untaxed = pd.to_numeric(df.get("amount_untaxed", 0), errors="coerce")
-    amount = pd.to_numeric(df.get("amount_signed", 0), errors="coerce").fillna(0.0)
-    mrr = pd.to_numeric(df.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
+def _valor_contrato_row(recurring_total, amount_untaxed, mrr, factor) -> float:
+    """Importe de un período del plan para una suscripción."""
+    try:
+        t = float(recurring_total) if recurring_total is not None and not pd.isna(recurring_total) else 0.0
+    except (TypeError, ValueError):
+        t = 0.0
+    try:
+        u = float(amount_untaxed) if amount_untaxed is not None and not pd.isna(amount_untaxed) else 0.0
+    except (TypeError, ValueError):
+        u = 0.0
+    try:
+        m = float(mrr) if mrr is not None and not pd.isna(mrr) else 0.0
+    except (TypeError, ValueError):
+        m = 0.0
+    f = float(factor) if factor else 1.0
 
-    valores = []
-    for i, idx in enumerate(df.index):
-        t = float(total.loc[idx]) if pd.notna(total.loc[idx]) else 0.0
-        u = float(untaxed.loc[idx]) if pd.notna(untaxed.loc[idx]) else 0.0
-        a = float(amount.loc[idx])
-        m = float(mrr.loc[idx])
-        f = float(factor.loc[idx]) if factor.loc[idx] else 1.0
+    if t > 0:
+        return t
+    # MRR × período del plan (8×3=24). Preferir esto a untaxed si untaxed ≈ MRR y el plan es >1 mes.
+    if m > 0 and f > 1.01:
+        periodo = m * f
+        if u > 0 and abs(u - periodo) / max(periodo, 1.0) < 0.08:
+            return u  # untaxed ya es el período
+        if u > 0 and abs(u - m) / max(m, 1.0) < 0.08:
+            return periodo  # untaxed es solo 1 mes de MRR → escalar
+        return periodo
+    if u > 0:
+        return u
+    if m > 0:
+        return m * max(f, 1.0)
+    return 0.0
 
-        if t > 0:
-            valores.append(t)
-            continue
-        if u > 0:
-            valores.append(u)
-            continue
-        # amount_signed es MRR (estándar Odoo) → × período del plan
-        base = a if a else m
-        if f > 1.01:
-            # Si amount ya ≈ base×f, no remultiplicar
-            if abs(a - base * f) / max(abs(base * f), 1.0) < 0.08 and a > base * 1.5:
-                valores.append(a)
-            else:
-                valores.append(base * f)
-        else:
-            valores.append(base)
-    return valores
+
+def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
+                                  team_id: int | None = None,
+                                  plans: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Cierre mes a mes: recurring_total / (MRR×plan) por first_contract_date."""
+    from odoo_io import _subscription_cierre_frame
+
+    fuente = "sale.order · first_contract_date + recurring_total (o MRR × plan)"
+    if not months:
+        return pd.DataFrame(columns=["mes", "vendido", "fuente"])
+    empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
+                          "fuente": [fuente] * len(months)})
+    sub = _subscription_cierre_frame(subs, team_id=team_id)
+    if sub.empty:
+        return empty
+    sub = sub.copy()
+    sub = sub[sub["first_contract_date"].notna()].copy()
+    if sub.empty:
+        return empty
+    # Solo contratos cuyo primer contrato cae en el rango de meses del filtro
+    sub["mes"] = sub["first_contract_date"].dt.to_period("M").astype(str)
+    sub = sub[sub["mes"].isin(months)].copy()
+    if sub.empty:
+        return empty
+
+    if "plan_id_num" not in sub.columns and "plan_id" in sub.columns:
+        sub["plan_id_num"] = m2o_id(sub["plan_id"])
+    factor = _plan_factor_series(sub, plans)
+    sub["periodo_plan_meses"] = factor
+    sub["valor_cierre"] = [
+        _valor_contrato_row(
+            sub.at[i, "recurring_total"] if "recurring_total" in sub.columns else 0,
+            sub.at[i, "amount_untaxed"] if "amount_untaxed" in sub.columns else 0,
+            sub.at[i, "recurring_monthly"] if "recurring_monthly" in sub.columns else 0,
+            factor.at[i],
+        )
+        for i in sub.index
+    ]
+    por_mes = sub.groupby("mes", as_index=False)["valor_cierre"].sum().rename(
+        columns={"valor_cierre": "vendido"}
+    )
+    out = pd.DataFrame({"mes": months}).merge(por_mes, on="mes", how="left")
+    out["vendido"] = out["vendido"].fillna(0.0)
+    out["fuente"] = fuente
+    return out
 
 
 def log_cierre_monthly(logs: pd.DataFrame, months: list[str],
                        team_id: int | None = None,
                        plans: pd.DataFrame | None = None,
                        subs: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Cierre desde eventos New: importe del período del plan."""
+    """Apoyo: eventos New del log, enriquecidos con la OV."""
     model = "sale.order.log.report"
     if logs is not None and not logs.empty and "_model" in logs.columns:
         model = str(logs["_model"].iloc[0])
-    fuente = f"{model} · New · recurring_total / (MRR × plan)"
+    fuente = f"{model} · New (apoyo)"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -293,14 +264,63 @@ def log_cierre_monthly(logs: pd.DataFrame, months: list[str],
     df = logs.copy()
     if "order_id_num" not in df.columns and "order_id" in df.columns:
         df["order_id_num"] = m2o_id(df["order_id"])
+    # Filtrar equipo solo si la mayoría de filas trae team_id (si no, no vaciar el set).
     if team_id is not None and "equipo_id" in df.columns:
-        df = df[pd.to_numeric(df["equipo_id"], errors="coerce") == int(team_id)]
+        eq = pd.to_numeric(df["equipo_id"], errors="coerce")
+        if eq.notna().mean() >= 0.5:
+            df = df[eq == int(team_id)]
     if "event_type" in df.columns:
         df = df[df["event_type"] == "0_creation"]
     if df.empty:
         return empty
 
-    df = _enrich_logs_from_subs(df, subs)
+    # Enrich desde suscripciones
+    if subs is not None and not subs.empty and "id" in subs.columns:
+        sub = subs.copy()
+        sub["id"] = pd.to_numeric(sub["id"], errors="coerce")
+        sub = sub[sub["id"].notna()].drop_duplicates(subset=["id"]).set_index("id")
+        totals, untaxeds, mrrs, plans_n, plans_name = [], [], [], [], []
+        for oid in pd.to_numeric(df["order_id_num"], errors="coerce"):
+            if pd.isna(oid) or oid not in sub.index:
+                totals.append(0.0)
+                untaxeds.append(0.0)
+                mrrs.append(0.0)
+                plans_n.append(None)
+                plans_name.append("")
+                continue
+            row = sub.loc[oid]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+            totals.append(float(pd.to_numeric(row.get("recurring_total", 0), errors="coerce") or 0))
+            untaxeds.append(float(pd.to_numeric(row.get("amount_untaxed", 0), errors="coerce") or 0))
+            mrrs.append(float(pd.to_numeric(row.get("recurring_monthly", 0), errors="coerce") or 0))
+            pid = row.get("plan_id")
+            if isinstance(pid, (list, tuple)) and pid:
+                try:
+                    plans_n.append(int(pid[0]))
+                except (TypeError, ValueError):
+                    plans_n.append(None)
+                plans_name.append(str(pid[1]) if len(pid) > 1 else "")
+            else:
+                try:
+                    plans_n.append(int(pid) if pd.notna(pid) else None)
+                except (TypeError, ValueError):
+                    plans_n.append(None)
+                plans_name.append(str(row.get("plan", "") or ""))
+        df["recurring_total"] = totals
+        df["amount_untaxed"] = untaxeds
+        if "recurring_monthly" not in df.columns or df["recurring_monthly"].isna().all():
+            df["recurring_monthly"] = mrrs
+        if "plan_id_num" not in df.columns:
+            df["plan_id_num"] = plans_n
+        else:
+            miss = pd.to_numeric(df["plan_id_num"], errors="coerce").isna()
+            df.loc[miss, "plan_id_num"] = pd.Series(plans_n, index=df.index)[miss]
+        blank_plan = df.get("plan", pd.Series("", index=df.index)).astype(str).isin(["", "Sin asignar", "False", "nan"])
+        if "plan" not in df.columns:
+            df["plan"] = plans_name
+        else:
+            df.loc[blank_plan, "plan"] = pd.Series(plans_name, index=df.index)[blank_plan]
 
     if "first_contract_date" in df.columns and df["first_contract_date"].notna().any():
         df["_mes_src"] = df["first_contract_date"].fillna(df.get("event_date"))
@@ -310,42 +330,27 @@ def log_cierre_monthly(logs: pd.DataFrame, months: list[str],
     if df.empty:
         return empty
     df["mes"] = pd.to_datetime(df["_mes_src"]).dt.to_period("M").astype(str)
+    df = df[df["mes"].isin(months)].copy()
+    if df.empty:
+        return empty
 
     factor = _plan_factor_series(df, plans)
-    df["periodo_plan_meses"] = factor
-    df["_valor"] = _valores_cierre(df, factor)
-
-    por_mes = df.groupby("mes", as_index=False)["_valor"].sum().rename(columns={"_valor": "vendido"})
-    out = pd.DataFrame({"mes": months}).merge(por_mes, on="mes", how="left")
-    out["vendido"] = out["vendido"].fillna(0.0)
-    out["fuente"] = fuente
-    return out
-
-
-def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
-                                  team_id: int | None = None,
-                                  plans: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Fallback: recurring_total (o MRR × plan) por first_contract_date."""
-    from odoo_io import _subscription_cierre_frame
-
-    fuente = "sale.order · first_contract_date + recurring_total (período del plan)"
-    if not months:
-        return pd.DataFrame(columns=["mes", "vendido", "fuente"])
-    empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
-                          "fuente": [fuente] * len(months)})
-    sub = _subscription_cierre_frame(subs, team_id=team_id)
-    if sub.empty:
-        return empty
-    sub = sub.copy()
-    sub["mes"] = sub["first_contract_date"].dt.to_period("M").astype(str)
-    if "plan_id_num" not in sub.columns and "plan_id" in sub.columns:
-        sub["plan_id_num"] = m2o_id(sub["plan_id"])
-    factor = _plan_factor_series(sub, plans)
-    # Adaptar columnas al helper de valores
-    if "amount_signed" not in sub.columns:
-        sub["amount_signed"] = pd.to_numeric(sub.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
-    sub["_valor"] = _valores_cierre(sub, factor)
-    por_mes = sub.groupby("mes", as_index=False)["_valor"].sum().rename(columns={"_valor": "vendido"})
+    amount = pd.to_numeric(df.get("amount_signed", 0), errors="coerce").fillna(0.0)
+    mrr = pd.to_numeric(df.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
+    # Si el log trae amount_signed, usarlo como MRR base cuando no hay recurring_monthly
+    mrr = mrr.where(mrr > 0, amount)
+    df["valor_cierre"] = [
+        _valor_contrato_row(
+            df.at[i, "recurring_total"] if "recurring_total" in df.columns else 0,
+            df.at[i, "amount_untaxed"] if "amount_untaxed" in df.columns else 0,
+            mrr.at[i],
+            factor.at[i],
+        )
+        for i in df.index
+    ]
+    por_mes = df.groupby("mes", as_index=False)["valor_cierre"].sum().rename(
+        columns={"valor_cierre": "vendido"}
+    )
     out = pd.DataFrame({"mes": months}).merge(por_mes, on="mes", how="left")
     out["vendido"] = out["vendido"].fillna(0.0)
     out["fuente"] = fuente
@@ -356,15 +361,37 @@ def staff_cierre_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | Non
                          months: list[str], team_id: int | None = None,
                          logs: pd.DataFrame | None = None,
                          plans: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Cierre: log.report New (+ enrich SO) → fallback suscripciones → staffing."""
+    """Cierre: suscripciones (principal) → log.report apoyo → staffing."""
+    out_subs = pd.DataFrame()
+    if subs is not None and not subs.empty:
+        out_subs = subscription_cierre_from_subs(subs, months, team_id=team_id, plans=plans)
+
+    out_logs = pd.DataFrame()
     if logs is not None and not logs.empty:
-        out = log_cierre_monthly(
+        out_logs = log_cierre_monthly(
             logs, months, team_id=team_id, plans=plans, subs=subs
         )
-        if out["vendido"].sum() > 0:
-            return out
-    if subs is not None and not subs.empty:
-        return subscription_cierre_from_subs(subs, months, team_id=team_id, plans=plans)
+
+    sum_s = float(out_subs["vendido"].sum()) if not out_subs.empty else 0.0
+    sum_l = float(out_logs["vendido"].sum()) if not out_logs.empty else 0.0
+
+    # Principal: suscripciones (cubre todos los meses con first_contract_date).
+    # Si el log aporta más en algún mes (importe de período), tomar el máximo mes a mes.
+    if sum_s > 0 and sum_l > 0:
+        m = out_subs.merge(out_logs, on="mes", how="outer", suffixes=("_s", "_l"))
+        m["vendido_s"] = m.get("vendido_s", 0).fillna(0.0)
+        m["vendido_l"] = m.get("vendido_l", 0).fillna(0.0)
+        m["vendido"] = m[["vendido_s", "vendido_l"]].max(axis=1)
+        m["fuente"] = "sale.order + log.report (max mes)"
+        # Reordenar a months
+        out = pd.DataFrame({"mes": months}).merge(m[["mes", "vendido", "fuente"]], on="mes", how="left")
+        out["vendido"] = out["vendido"].fillna(0.0)
+        out["fuente"] = out["fuente"].fillna("sale.order + log.report (max mes)")
+        return out
+    if sum_s > 0:
+        return out_subs
+    if sum_l > 0:
+        return out_logs
     return staffing_cierre_monthly(
         requests if requests is not None else pd.DataFrame(), months
     )
@@ -377,4 +404,5 @@ __all__ = [
     "log_cierre_monthly",
     "staff_cierre_monthly",
     "staff_cierre_detail",
+    "subscription_cierre_from_subs",
 ]
