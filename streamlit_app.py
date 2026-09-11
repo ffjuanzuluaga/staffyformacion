@@ -41,8 +41,6 @@ from odoo_io import (
     load_teams,
     load_won,
     month_list,
-    months_between,
-    _duration_months,
     resolve_linea_teams,
     staff_cierre_detail,
     staff_cierre_monthly,
@@ -79,6 +77,29 @@ def _fmt_mes_label(mes_key: str) -> str:
         return pd.Period(mes_key, freq="M").strftime("%b %Y")
     except Exception:
         return mes_key
+
+
+
+def months_between(d1, d2) -> list[str]:
+    """Lista de meses 'YYYY-MM' inclusivos entre dos fechas."""
+    p1 = pd.Period(d1, freq="M")
+    p2 = pd.Period(d2, freq="M")
+    if p2 < p1:
+        p1, p2 = p2, p1
+    return [str(p1 + i) for i in range((p2 - p1).n + 1)]
+
+
+def _duration_months(start, end) -> int:
+    """Meses de vigencia inclusivos (start→end). Sin fin → 1."""
+    if pd.isna(start):
+        return 1
+    start_p = pd.Period(start, freq="M")
+    if pd.isna(end):
+        return 1
+    end_p = pd.Period(end, freq="M")
+    if end_p < start_p:
+        return 1
+    return int((end_p - start_p).n) + 1
 
 
 def fmt_money(v: float) -> str:
