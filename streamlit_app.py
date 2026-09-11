@@ -41,6 +41,8 @@ from odoo_io import (
     load_teams,
     load_won,
     month_list,
+    months_between,
+    _duration_months,
     resolve_linea_teams,
     staff_cierre_detail,
     staff_cierre_monthly,
@@ -59,8 +61,8 @@ st.set_page_config(
 
 
 # Vendido (Formación / Fábrica) = amount_untaxed_company (COP, OV + TRM).
-# Vendido Staff (KPI anual) = total con recurrencia: MRR × meses de vigencia.
-# Cierre Staff (gráfico mes a mes) = MRR nuevo por first_contract_date.
+# Vendido Staff (KPI período) = total con recurrencia: MRR × meses de vigencia.
+# Cierre Staff (gráfico mes a mes) = Recurrente × meses vigencia en first_contract_date.
 # Facturado = amount_untaxed_signed → base imponible en COP compañía
 # (Odoo ya convierte USD→COP al contabilizar). NC restan.
 # amount_untaxed_in_currency_signed se muestra solo en debug (moneda documento).
@@ -69,6 +71,14 @@ SALES_COL_FALLBACK = "amount_untaxed"
 FACT_COL = "amount_untaxed_signed"
 FACT_COL_DOC = "amount_untaxed_in_currency_signed"
 STAFF_VENDIDO_COL = "vendido"
+
+
+def _fmt_mes_label(mes_key: str) -> str:
+    """'2026-08' → 'ago 2026'."""
+    try:
+        return pd.Period(mes_key, freq="M").strftime("%b %Y")
+    except Exception:
+        return mes_key
 
 
 def fmt_money(v: float) -> str:
@@ -110,7 +120,21 @@ def semaforo(pct: float) -> str:
 st.sidebar.title("⚙️ Filtros")
 
 hoy = date.today()
-anio = st.sidebar.selectbox("Año a analizar", options=range(hoy.year, hoy.year - 4, -1), index=0)
+rango_fechas = st.sidebar.date_input(
+    "Rango de fechas",
+    value=(date(hoy.year, 1, 1), hoy),
+    format="DD/MM/YYYY",
+    help="Los gráficos y KPIs del período usan este rango. "
+         "«Mes actual» = último mes del rango (p. ej. ene–ago → agosto).",
+)
+if isinstance(rango_fechas, (list, tuple)) and len(rango_fechas) == 2:
+    fecha_desde, fecha_hasta = rango_fechas[0], rango_fechas[1]
+elif isinstance(rango_fechas, date):
+    fecha_desde = fecha_hasta = rango_fechas
+else:
+    fecha_desde, fecha_hasta = date(hoy.year, 1, 1), hoy
+if fecha_hasta < fecha_desde:
+    fecha_desde, fecha_hasta = fecha_hasta, fecha_desde
 
 if st.sidebar.button("🔄 Refrescar datos"):
     st.cache_data.clear()
@@ -132,7 +156,7 @@ if not team_ids:
 if metas_lineas.empty or (metas_lineas["meta_anual"] == 0).all():
     st.sidebar.warning("Completa `data/metas_lineas.csv` con las metas anuales reales.")
 if not costos_fijos.empty and (costos_fijos["costo_mensual"] == 0).all():
-    st.sidebar.info("Los costos fijos de Diego/Paula están en 0. Actualiza `data/costos_fijos.csv` cuando Raquel confirme el valor.")
+    st.sidebar.info("Los costos fijos de Diego/Paula van en 0. Actualiza `data/costos_fijos.csv` cuando Raquel confirme el valor.")
 
 missing_teams = [LINEA_TEAM[l] for l in LINEA_TEAM if l not in resolved_teams]
 if resolved_teams:
@@ -144,13 +168,17 @@ if resolved_teams:
         )
     )
 
-d1, d2 = f"{anio}-01-01", f"{anio}-12-31"
+d1, d2 = fecha_desde.isoformat(), fecha_hasta.isoformat()
+periodo_label = f"{fecha_desde:%d/%m/%Y} – {fecha_hasta:%d/%m/%Y}"
 desde_12m = (pd.Period(hoy, freq="M") - 11).to_timestamp().date().isoformat()
 hoy_iso = hoy.isoformat()
-months_year = [f"{anio}-{m:02d}" for m in range(1, 13)]
+months_year = months_between(fecha_desde, fecha_hasta)
+n_meses_periodo = max(len(months_year), 1)
 meses_12 = month_list(desde_12m, 12)
 meses_6fwd = [str(pd.Period(hoy, freq="M") + i) for i in range(1, 7)]
-mes_actual_key = f"{hoy.year}-{hoy.month:02d}"
+# «Mes actual» = último mes del filtro (no el calendario de hoy).
+mes_actual_key = months_year[-1] if months_year else f"{hoy.year}-{hoy.month:02d}"
+mes_actual_label = _fmt_mes_label(mes_actual_key)
 
 # ─────────────────────────────────────────────
 # Carga única (compartida por todas las pestañas)
@@ -305,7 +333,7 @@ staff_vendido_mes = staff_cierre_mes
 
 st.title("📋 Dashboard Staff, Formación y Fábrica de Software")
 st.caption(
-    f"Año {anio} · montos **antes de impuestos** · "
+    f"Período {periodo_label} · montos **antes de impuestos** · "
     f"línea = equipo CRM ({', '.join(LINEA_TEAM.values())}) "
     f"o `service_line` / solicitud Staff · "
     f"cuentas analíticas: {', '.join(LINEA_ANALYTIC.values())}"
@@ -319,11 +347,13 @@ def kpis_linea(linea: str) -> dict:
     sales = filtro_linea(sales_all, linea)
     invoices = filtro_linea(invoices_all, linea)
     leads = filtro_linea(leads_all, linea)
-    meta = meta_anual_de(metas_lineas, linea)
+    meta_anual = meta_anual_de(metas_lineas, linea)
+    # Meta del período = (meta anual / 12) × meses del filtro.
+    meta = meta_anual / 12.0 * n_meses_periodo
     scol = sales_amount_col(sales)
     if linea == "Staff":
         vendido = staff_vendido_anual
-        # El gráfico de "cierre mes a mes" usa el cierre; el KPI anual usa recurrencia.
+        # El gráfico de "cierre mes a mes" usa el cierre; el KPI del período usa recurrencia.
         sales_for_chart = staff_cierre_mes.rename(columns={"vendido": STAFF_VENDIDO_COL})
     else:
         vendido = float(sales[scol].sum()) if not sales.empty and scol in sales else 0.0
@@ -331,7 +361,8 @@ def kpis_linea(linea: str) -> dict:
     facturado = float(invoices[FACT_COL].sum()) if not invoices.empty and FACT_COL in invoices else 0.0
     leads_mes = int(leads.loc[leads["mes"] == mes_actual_key].shape[0]) if not leads.empty else 0
     return {
-        "meta_anual": meta,
+        "meta_anual": meta_anual,
+        "meta_periodo": meta,
         "vendido_anual": vendido,
         "facturado_anual": facturado,
         "pct_cumpl": (vendido / meta * 100) if meta else 0.0,
@@ -369,7 +400,7 @@ def chart_venta_vs_meta(linea: str, sales: pd.DataFrame):
     meta_m = meta_anual_de(metas_lineas, linea) / 12
     if linea == "Staff":
         scol = STAFF_VENDIDO_COL
-        titulo = f"{linea} — cierre MRR (Fecha primer contrato) vs. meta mensual ({anio})"
+        titulo = f"{linea} — cierre (Recurrente × meses) vs. meta mensual ({periodo_label})"
         ventas_mes = (
             sales.groupby("mes", as_index=False)[scol].sum()
             if sales is not None and not sales.empty and scol in sales
@@ -377,7 +408,7 @@ def chart_venta_vs_meta(linea: str, sales: pd.DataFrame):
         )
     else:
         scol = sales_amount_col(sales)
-        titulo = f"{linea} — vendido s/imp. (OV) vs. meta mensual ({anio})"
+        titulo = f"{linea} — vendido s/imp. (OV) vs. meta mensual ({periodo_label})"
         ventas_mes = (
             sales.groupby("mes", as_index=False)[scol].sum()
             if not sales.empty and scol in sales else pd.DataFrame(columns=["mes", scol])
@@ -406,7 +437,7 @@ def chart_fact_y_leads(linea: str, invoices: pd.DataFrame, leads: pd.DataFrame):
         else:
             fact_mes = invoices.groupby("mes", as_index=False)[FACT_COL].sum()
             fig = px.bar(fact_mes, x="mes", y=FACT_COL, text_auto=".2s",
-                         title=f"{linea} — facturación s/imp. ({anio})",
+                         title=f"{linea} — facturación s/imp. ({periodo_label})",
                          labels={FACT_COL: "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
     with col_b:
@@ -416,7 +447,7 @@ def chart_fact_y_leads(linea: str, invoices: pd.DataFrame, leads: pd.DataFrame):
         else:
             leads_mes = leads.groupby("mes", as_index=False).agg(leads=("name", "count"))
             fig = px.bar(leads_mes, x="mes", y="leads", text_auto=True,
-                         title=f"{linea} — leads nuevos ({anio})",
+                         title=f"{linea} — leads nuevos ({periodo_label})",
                          labels={"leads": "Leads", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
@@ -428,7 +459,7 @@ def chart_leads_origen(linea: str, leads: pd.DataFrame):
         return
     origen_mes = leads.groupby(["mes", "origen"], as_index=False).agg(leads=("name", "count"))
     fig = px.bar(origen_mes, x="mes", y="leads", color="origen", barmode="stack",
-                 title=f"{linea} — leads por origen y mes ({anio})",
+                 title=f"{linea} — leads por origen y mes ({periodo_label})",
                  labels={"leads": "Leads", "mes": "Mes"})
     st.plotly_chart(fig, use_container_width=True)
 
@@ -443,7 +474,7 @@ def chart_rentabilidad_contable(linea: str):
         st.warning(err_costo)
     rent = rentabilidad_contable(linea)
     fig = px.bar(rent, x="mes", y="rentabilidad", text_auto=".2s",
-                 title=f"{linea} — rentabilidad contable ({anio})",
+                 title=f"{linea} — rentabilidad contable ({periodo_label})",
                  labels={"rentabilidad": "COP", "mes": "Mes"})
     st.plotly_chart(fig, use_container_width=True)
     with st.expander("Detalle de rentabilidad mensual"):
@@ -506,19 +537,19 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     k = kpis_linea(linea)
     c0, c1, c2, c3, c4 = st.columns(5)
     c0.metric(extra_kpi_label, extra_kpi_value)
-    c1.metric("Cumplimiento meta anual", f"{k['pct_cumpl']:.1f}%")
-    c2.metric(f"Vendido s/imp. en {linea} (año)", fmt_money(k["vendido_anual"]))
-    c3.metric("Facturación s/imp. (año)", fmt_money(k["facturado_anual"]))
-    c4.metric("Leads del mes", k["leads_mes"])
+    c1.metric("Cumplimiento meta del período", f"{k['pct_cumpl']:.1f}%")
+    c2.metric(f"Vendido s/imp. en {linea} (período)", fmt_money(k["vendido_anual"]))
+    c3.metric("Facturación s/imp. (período)", fmt_money(k["facturado_anual"]))
+    c4.metric(f"Leads de {mes_actual_label}", k["leads_mes"])
     if linea == "Staff":
         st.caption(
             f"Todos los pesos son **antes de impuestos**. "
             f"**Vendido Staff (KPI de arriba)** = valor mensual de la plaza × meses vigentes "
             f"(equivalente a suscripción × plan mensual; fuente: `{staff_vendido_fuente}`). "
             f"Hoy: {fmt_money(staff_vendido_anual)}. "
-            f"**Cierre del año** (contratos nuevos por Fecha del primer contrato): "
+            f"**Cierre del período** (contratos nuevos: Recurrente × meses de vigencia): "
             f"{fmt_money(staff_cierre_anual)} (`{staff_cierre_fuente}`). "
-            f"El gráfico de abajo es el **cierre mes a mes** (p. ej. agosto = 14M). "
+            f"El gráfico de abajo es el **cierre mes a mes** (p. ej. 8M × 3 meses = 24M). "
             f"**Facturado** = líneas de asiento `display_type=product` (−`balance` COP)."
         )
     else:
@@ -549,13 +580,13 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                 f"Suma anual (KPI de arriba): {fmt_money(staff_vendido_anual)}. "
                 "Con plan mensual: cada mes vigente suma el Recurrente de la suscripción."
             )
-        with st.expander("Detalle cierre Staff (Fecha del primer contrato — gráfico mes a mes)"):
+        with st.expander("Detalle cierre Staff (Recurrente × meses — gráfico mes a mes)"):
             st.dataframe(
                 staff_cierre_mes,
                 use_container_width=True, hide_index=True,
                 column_config={
                     "mes": "Mes",
-                    "vendido": st.column_config.NumberColumn("MRR cerrado", format="$%,.0f"),
+                    "vendido": st.column_config.NumberColumn("Valor cerrado", format="$%,.0f"),
                     "fuente": "Fuente",
                 },
             )
@@ -564,20 +595,32 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                 det = det.copy()
                 det["mes"] = det["first_contract_date"].dt.to_period("M").astype(str)
                 det = det[det["mes"].isin(months_year)]
+                start = det["start_date"] if "start_date" in det.columns else det["first_contract_date"]
+                if "first_contract_date" in det.columns:
+                    start = start.fillna(det["first_contract_date"])
+                end = det["end_date"] if "end_date" in det.columns else pd.Series(pd.NaT, index=det.index)
+                det["meses_vigencia"] = [_duration_months(s, e) for s, e in zip(start, end)]
+                det["valor_contrato"] = (
+                    pd.to_numeric(det.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
+                    * det["meses_vigencia"]
+                )
                 cols = [c for c in [
-                    "name", "cliente", "first_contract_date", "mes", "subscription_state",
-                    "moneda", "recurring_monthly", "equipo",
+                    "name", "cliente", "first_contract_date", "mes", "start_date", "end_date",
+                    "meses_vigencia", "subscription_state", "moneda", "recurring_monthly",
+                    "valor_contrato", "equipo",
                 ] if c in det.columns]
                 if cols:
                     st.caption(
-                        "Contratos nuevos del año (mismo corte que Odoo Suscripciones). "
-                        f"Suma cierre año: {fmt_money(staff_cierre_anual)}."
+                        "Contratos nuevos del período (Recurrente × meses start→end). "
+                        f"Suma cierre período: {fmt_money(staff_cierre_anual)}."
                     )
                     st.dataframe(
                         det[cols].sort_values("first_contract_date"),
                         use_container_width=True, hide_index=True,
                         column_config={
                             "recurring_monthly": st.column_config.NumberColumn("Recurrente", format="%,.0f"),
+                            "meses_vigencia": st.column_config.NumberColumn("Meses", format="%d"),
+                            "valor_contrato": st.column_config.NumberColumn("Valor contrato", format="%,.0f"),
                         },
                     )
             else:
@@ -651,6 +694,7 @@ with tab_resumen:
         resumen_rows.append({
             "linea": linea,
             "meta_anual": k["meta_anual"],
+            "meta_periodo": k["meta_periodo"],
             "vendido": k["vendido_anual"],
             "facturado": k["facturado_anual"],
             "pct_cumpl": k["pct_cumpl"],
@@ -660,22 +704,22 @@ with tab_resumen:
     resumen_df = pd.DataFrame(resumen_rows)
 
     # 1. ¿Cumplimos metas?
-    st.markdown("#### 1. ¿Estamos cumpliendo las metas de ventas anuales?")
+    st.markdown(f"#### 1. ¿Estamos cumpliendo las metas de ventas? ({periodo_label})")
     cols = st.columns(3)
     for i, row in resumen_df.iterrows():
         with cols[i]:
             st.metric(
                 f"{semaforo(row['pct_cumpl'])} {row['linea']}",
                 f"{row['pct_cumpl']:.1f}%",
-                help=f"Vendido {fmt_money(row['vendido'])} de meta {fmt_money(row['meta_anual'])}",
+                help=f"Vendido {fmt_money(row['vendido'])} de meta del período {fmt_money(row['meta_periodo'])}",
             )
-            st.caption(f"{fmt_money(row['vendido'])} / {fmt_money(row['meta_anual'])}")
+            st.caption(f"{fmt_money(row['vendido'])} / {fmt_money(row['meta_periodo'])}")
     st.dataframe(
-        resumen_df[["linea", "meta_anual", "vendido", "facturado", "pct_cumpl"]],
+        resumen_df[["linea", "meta_periodo", "vendido", "facturado", "pct_cumpl"]],
         use_container_width=True, hide_index=True,
         column_config={
             "linea": "Línea",
-            "meta_anual": st.column_config.NumberColumn("Meta año", format="$%,.0f"),
+            "meta_periodo": st.column_config.NumberColumn("Meta período", format="$%,.0f"),
             "vendido": st.column_config.NumberColumn("Vendido s/imp.", format="$%,.0f"),
             "facturado": st.column_config.NumberColumn("Facturado s/imp.", format="$%,.0f"),
             "pct_cumpl": st.column_config.ProgressColumn("% Cumplimiento", format="%.1f%%", min_value=0, max_value=150),
@@ -685,9 +729,9 @@ with tab_resumen:
         f"Montos **antes de impuestos**. Para cuadrar en Odoo · "
         f"**Vendido Staff (KPI):** valor suscripción × plan recurrente "
         f"(Recurrente × meses vigentes; `{staff_vendido_fuente}`). "
-        f"**Cierre Staff (contratos nuevos):** {fmt_money(staff_cierre_anual)} por "
-        f"Fecha del primer contrato. "
-        f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {anio} · "
+        f"**Cierre Staff (contratos nuevos):** {fmt_money(staff_cierre_anual)} = "
+        f"Recurrente × meses de vigencia. "
+        f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {periodo_label} · "
         f"Confirmado · Importe sin impuestos. "
         f"**Facturado:** `account.move.line` publicadas · tipo **product** · "
         f"**−balance** (COP compañía, TRM de la factura). "
@@ -756,7 +800,7 @@ with tab_resumen:
         else:
             origen = leads_all.groupby(["linea", "origen"], as_index=False).agg(leads=("name", "count"))
             fig = px.bar(origen, x="origen", y="leads", color="linea", barmode="group",
-                         title="Leads del año por origen y línea",
+                         title="Leads del período por origen y línea",
                          labels={"leads": "Leads", "origen": "Origen"})
             st.plotly_chart(fig, use_container_width=True)
             top = (leads_all.groupby("origen", as_index=False).agg(leads=("name", "count"))
@@ -764,12 +808,12 @@ with tab_resumen:
             st.caption("Afianzar los orígenes con más volumen: " + ", ".join(top["origen"].tolist()))
     with col2:
         if leads_all.empty:
-            st.info("Sin leads del mes.")
+            st.info(f"Sin leads en {mes_actual_label}.")
         else:
             leads_mes_l = (leads_all[leads_all["mes"] == mes_actual_key]
                            .groupby("linea", as_index=False).agg(leads=("name", "count")))
             fig = px.bar(leads_mes_l, x="linea", y="leads", text_auto=True,
-                         title="Leads del mes actual por línea",
+                         title=f"Leads de {mes_actual_label} por línea",
                          labels={"leads": "Leads", "linea": "Línea"})
             st.plotly_chart(fig, use_container_width=True)
             if not won_all.empty:
@@ -796,7 +840,7 @@ with tab_resumen:
             lambda r: r["vendido"] / r["unit_amount"] if r["unit_amount"] else 0, axis=1
         )
         fig = px.bar(mix, x="linea", y="unit_amount", text_auto=".1f",
-                     title="Horas del año por línea (timesheet analítico)",
+                     title="Horas del período por línea (timesheet analítico)",
                      labels={"unit_amount": "Horas", "linea": "Línea"})
         st.plotly_chart(fig, use_container_width=True)
         st.dataframe(
@@ -852,7 +896,7 @@ with tab_staff:
 
     renov_mes = int(renewals.loc[renewals["mes"] == mes_actual_key].shape[0]) if renewals is not None and not renewals.empty else 0
     render_linea_comun("Staff", "Plazas activas actualmente", plazas_actuales)
-    st.metric("Suscripciones renovadas este mes", renov_mes)
+    st.metric(f"Suscripciones renovadas en {mes_actual_label}", renov_mes)
 
     st.divider()
     st.markdown("#### 📈 Tendencia de plazas (12 meses) y proyección (6 meses, plazas ya vendidas)")
@@ -898,7 +942,7 @@ with tab_staff:
         # Transferencia positiva en sale.order.log = renovación confirmada
         transfers = sub_logs[(sub_logs["event_type"] == "3_transfer") & (sub_logs["amount_signed"] > 0)]
         if transfers.empty:
-            st.info("No hay renovaciones registradas este año.")
+            st.info("No hay renovaciones registradas en el período.")
         else:
             t_mes = transfers.groupby("mes", as_index=False).agg(renovaciones=("suscripcion", "count"))
             fig = px.bar(t_mes, x="mes", y="renovaciones", text_auto=True,
@@ -976,14 +1020,14 @@ with tab_formacion:
     won_form = filtro_linea(won_all, "Formación")
     if not proj_form.empty:
         cursos_entregados = int(len(proj_form))
-        extra_label = "Cursos entregados en el año"
+        extra_label = "Cursos entregados en el período"
         extra_val = cursos_entregados
         st.caption(
-            "Entregados = proyectos `service_line=training` con fecha de fin/inicio en el año. "
+            "Entregados = proyectos `service_line=training` con fecha de fin/inicio en el período. "
             "El campo dedicado de fecha de entrega de capacitaciones aún no existe (JUAN Z)."
         )
     else:
-        extra_label = "Cursos vendidos en el año (CRM)"
+        extra_label = "Cursos vendidos en el período (CRM)"
         extra_val = int(len(won_form))
         if err_proj:
             st.info(err_proj)
@@ -1011,10 +1055,10 @@ with tab_fabrica:
     proj_fab = filtro_linea(projects, "Fábrica de Software") if projects is not None else pd.DataFrame()
     won_fab = filtro_linea(won_all, "Fábrica de Software")
     if not proj_fab.empty:
-        extra_label = "Proyectos acumulados del año"
+        extra_label = "Proyectos acumulados del período"
         extra_val = int(len(proj_fab))
     else:
-        extra_label = "Proyectos vendidos en el año (CRM)"
+        extra_label = "Proyectos vendidos en el período (CRM)"
         extra_val = int(len(won_fab))
 
     render_linea_comun("Fábrica de Software", extra_label, extra_val)
@@ -1042,7 +1086,7 @@ with tab_equipo:
     if err_horas:
         st.warning(err_horas)
     elif horas_df.empty:
-        st.info("No hay horas registradas (account.analytic.line) en el año.")
+        st.info("No hay horas registradas (account.analytic.line) en el período.")
     else:
         col1, col2 = st.columns(2)
         with col1:
@@ -1055,7 +1099,7 @@ with tab_equipo:
             horas_persona = (horas_df.groupby("persona", as_index=False)["unit_amount"].sum()
                              .sort_values("unit_amount", ascending=True).tail(15))
             fig = px.bar(horas_persona, x="unit_amount", y="persona", orientation="h",
-                         title="Horas totales por persona (año)", text_auto=".1f",
+                         title="Horas totales por persona (período)", text_auto=".1f",
                          labels={"unit_amount": "Horas", "persona": ""})
             st.plotly_chart(fig, use_container_width=True)
         with st.expander("Horas por persona, mes y línea"):
@@ -1076,7 +1120,7 @@ with tab_equipo:
     if err_act_h:
         st.warning(err_act_h)
     elif act_hist.empty:
-        st.info("No hay actividades completadas en `crm.activity.report` este año. Paula: registrar actividades en el CRM.")
+        st.info("No hay actividades completadas en `crm.activity.report` este período. Paula: registrar actividades en el CRM.")
     else:
         comercial = act_hist[act_hist["tipo"].map(es_tipo_comercial)]
         usar = comercial if not comercial.empty else act_hist

@@ -318,6 +318,28 @@ def month_list(start: str, n: int) -> list[str]:
     return [str(p + i) for i in range(n)]
 
 
+def months_between(d1, d2) -> list[str]:
+    """Lista de meses 'YYYY-MM' inclusivos entre dos fechas."""
+    p1 = pd.Period(d1, freq="M")
+    p2 = pd.Period(d2, freq="M")
+    if p2 < p1:
+        p1, p2 = p2, p1
+    return [str(p1 + i) for i in range((p2 - p1).n + 1)]
+
+
+def _duration_months(start, end) -> int:
+    """Meses de vigencia inclusivos (start→end). Sin fin → 1 (solo el MRR de cierre)."""
+    if pd.isna(start):
+        return 1
+    start_p = pd.Period(start, freq="M")
+    if pd.isna(end):
+        return 1
+    end_p = pd.Period(end, freq="M")
+    if end_p < start_p:
+        return 1
+    return int((end_p - start_p).n) + 1
+
+
 def coverage_mask(df: pd.DataFrame, start_col: str, end_col: str, mes: str) -> pd.Series:
     period = pd.Period(mes, freq="M")
     month_start = period.to_timestamp(how="start")
@@ -1190,12 +1212,12 @@ def _subscription_cierre_frame(subs: pd.DataFrame, team_id: int | None = None) -
 
 def subscription_cierre_monthly(subs: pd.DataFrame, months: list[str],
                                 team_id: int | None = None) -> pd.DataFrame:
-    """Vendido Staff = Σ Recurrente (MRR) con first_contract_date en el mes.
+    """Cierre Staff = Σ (Recurrente × meses de vigencia) en el mes de first_contract_date.
 
-    Alineado a Odoo → Suscripciones → agrupar por Fecha del primer contrato
-    (dominio por defecto sin estados Renovada/Upsell/Cotización).
+    Ej.: suscripción 8M/mes por 3 meses → 24M en el mes del primer contrato.
+    Sin end_date se cuenta 1 mes (solo el MRR).
     """
-    fuente = "sale.order · first_contract_date + recurring_monthly (equipo Staff)"
+    fuente = "sale.order · first_contract_date + Recurrente × meses vigencia"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -1204,10 +1226,18 @@ def subscription_cierre_monthly(subs: pd.DataFrame, months: list[str],
     if sub.empty:
         return empty
 
+    sub = sub.copy()
     sub["mes"] = sub["first_contract_date"].dt.to_period("M").astype(str)
-    # Columna Recurrente del listado Odoo (no la conversión a compañía).
+    start = sub["start_date"] if "start_date" in sub.columns else sub["first_contract_date"]
+    if "first_contract_date" in sub.columns:
+        start = start.fillna(sub["first_contract_date"])
+    end = sub["end_date"] if "end_date" in sub.columns else pd.Series(pd.NaT, index=sub.index)
     sub["_mrr"] = pd.to_numeric(sub.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
-    por_mes = sub.groupby("mes", as_index=False)["_mrr"].sum().rename(columns={"_mrr": "vendido"})
+    sub["_meses"] = [
+        _duration_months(s, e) for s, e in zip(start, end)
+    ]
+    sub["_valor"] = sub["_mrr"] * sub["_meses"]
+    por_mes = sub.groupby("mes", as_index=False)["_valor"].sum().rename(columns={"_valor": "vendido"})
     out = pd.DataFrame({"mes": months}).merge(por_mes, on="mes", how="left")
     out["vendido"] = out["vendido"].fillna(0.0)
     out["fuente"] = fuente
@@ -1215,8 +1245,8 @@ def subscription_cierre_monthly(subs: pd.DataFrame, months: list[str],
 
 
 def staffing_cierre_monthly(requests: pd.DataFrame, months: list[str]) -> pd.DataFrame:
-    """Fallback sin suscripciones: MRR de plazas cuyo date_start cae en el mes."""
-    fuente = "firefly.staffing.request · date_start"
+    """Fallback: valor mensual × meses de vigencia en el mes de date_start."""
+    fuente = "firefly.staffing.request · date_start × meses vigencia"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -1233,7 +1263,12 @@ def staffing_cierre_monthly(requests: pd.DataFrame, months: list[str]) -> pd.Dat
     usable["_mrr"] = pd.to_numeric(
         usable.get("monthly_amount_company_currency", 0), errors="coerce"
     ).fillna(0.0)
-    por_mes = usable.groupby("mes", as_index=False)["_mrr"].sum().rename(columns={"_mrr": "vendido"})
+    end = usable["date_end"] if "date_end" in usable.columns else pd.Series(pd.NaT, index=usable.index)
+    usable["_meses"] = [
+        _duration_months(s, e) for s, e in zip(usable["date_start"], end)
+    ]
+    usable["_valor"] = usable["_mrr"] * usable["_meses"]
+    por_mes = usable.groupby("mes", as_index=False)["_valor"].sum().rename(columns={"_valor": "vendido"})
     out = pd.DataFrame({"mes": months}).merge(por_mes, on="mes", how="left")
     out["vendido"] = out["vendido"].fillna(0.0)
     out["fuente"] = fuente
@@ -1242,7 +1277,7 @@ def staffing_cierre_monthly(requests: pd.DataFrame, months: list[str]) -> pd.Dat
 
 def staff_cierre_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | None,
                          months: list[str], team_id: int | None = None) -> pd.DataFrame:
-    """Cierre comercial: MRR nuevo por Fecha del primer contrato (mes a mes)."""
+    """Cierre comercial: valor contrato (MRR × meses) por Fecha del primer contrato."""
     if subs is not None and not subs.empty:
         return subscription_cierre_monthly(subs, months, team_id=team_id)
     return staffing_cierre_monthly(
