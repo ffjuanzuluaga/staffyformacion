@@ -638,7 +638,7 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                 ] if c in det.columns]
                 st.caption(
                     "En el mes de **`create_date`** de la OV: Valor vendido = "
-                    "**MRR × meses** (desde inicio hasta fin del contrato). "
+                    "**MRR × meses completos** (duración real inicio→fin; p.ej. 8-sep→16-dic = 3, no 4). "
                     "Ej. 8M × 3 meses = 24M. Sin fecha fin = 1 mes. Sin MRR (venta puntual/cancelada sin plan) = `amount_untaxed`. "
                     f"Suma del período: {fmt_money(staff_cierre_anual)}."
                 )
