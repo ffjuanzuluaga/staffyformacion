@@ -5,14 +5,14 @@ Regla de negocio (ventas recurrentes):
   En el mes de creación de la orden se toma el valor mensual (MRR) y *hasta cuándo va*
   la suscripción. Ese producto es lo vendido.
 
-  Ejemplos:
-    - 8.000.000 / mes × 3 meses  →  24.000.000 en el mes de create_date
-    - 14.000.000 / mes × 1 mes   →  14.000.000 en el mes de create_date
+  Valor = MRR × meses completos + (MRR / 30) × días sueltos
+  (duración real start_date → end_date; no meses de calendario inclusivos).
 
-  Meses = duración real start_date → end_date (meses completos).
-  Ej. 8-sep → 16-dic = 3 meses (+ días sueltos; no cuentan como 4º mes).
-  No se usan meses de calendario inclusivos (eso contaría sep+oct+nov+dic = 4).
-  Sin fecha fin → 1 mes.
+  Ejemplos (8-sep → 15-dic = 3 meses + 7 días):
+    - 10.000.000 × 3 + 10.000.000/30 × 7  →  32.333.333
+    -  4.800.000 × 3 +  4.800.000/30 × 7  →  15.520.000
+
+  Sin fecha fin → 1 mes (solo MRR).
   Sin MRR / sin plan recurrente → amount_untaxed (venta puntual, p.ej. 7M).
 """
 
@@ -34,30 +34,41 @@ from odoo_io import (
 )
 
 
-def contract_months(start, end) -> int:
-    """Meses completos entre start y end (duración real, no calendario inclusivo).
+def contract_duration(start, end) -> tuple[int, int]:
+    """(meses_completos, días_sueltos) entre start y end.
 
-    8-sep → 16-dic → 3 (quedan ~8 días sueltos; no suman otro mes).
-    Sin fin o vigencia < 1 mes completo → 1.
+    Sin fin o sin inicio → (1, 0) = un mes cerrado.
     """
     if pd.isna(start):
-        return 1
+        return 1, 0
     s = pd.Timestamp(start).normalize()
     if pd.isna(end):
-        return 1
+        return 1, 0
     e = pd.Timestamp(end).normalize()
     if e < s:
-        return 1
+        return 1, 0
+    if e == s:
+        return 0, 1
     rd = relativedelta(e.to_pydatetime(), s.to_pydatetime())
     months = int(rd.years * 12 + rd.months)
-    # Contrato corto (< 1 mes completo) o solo días sueltos: cuenta 1.
-    return max(months, 1)
+    days = int(rd.days)
+    if months == 0 and days == 0:
+        return 0, 1
+    return months, days
+
+
+def contract_months(start, end) -> int:
+    """Meses completos (compat). Sin fin → 1."""
+    months, days = contract_duration(start, end)
+    if months == 0 and days > 0:
+        return 0
+    return max(months, 1) if months == 0 and days == 0 else months
 
 
 def valor_vendido_contrato(mrr, start, end, amount_untaxed=0.0) -> float:
     """Valor vendido en el mes de create_date.
 
-    - Con MRR (plan recurrente): MRR × meses completos (inicio→fin).
+    - Con MRR: MRR × meses + (MRR / 30) × días.
     - Sin plan / MRR=0 (venta puntual p.ej. 7M un mes): amount_untaxed.
     """
     try:
@@ -69,7 +80,8 @@ def valor_vendido_contrato(mrr, start, end, amount_untaxed=0.0) -> float:
     except (TypeError, ValueError):
         untaxed = 0.0
     if m > 0:
-        return m * contract_months(start, end)
+        months, days = contract_duration(start, end)
+        return m * months + (m / 30.0) * days
     # Sin recurrente: la venta puntual (1 mes o lo que diga el pedido).
     return max(untaxed, 0.0)
 
@@ -165,10 +177,10 @@ def plan_period_months(value, unit) -> float:
 def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
                                   team_id: int | None = None,
                                   plans: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Suma en el mes de create_date: MRR × meses (start→end)."""
+    """Suma en el mes de create_date: MRR × meses + (MRR/30) × días."""
     from odoo_io import _subscription_cierre_frame
 
-    fuente = "MRR × meses del contrato (mes de create_date de la OV)"
+    fuente = "MRR × meses + (MRR/30)×días (mes create_date)"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -192,7 +204,7 @@ def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
     if sub.empty:
         return empty
 
-    # Vigencia del contrato (para × meses); no define el mes del gráfico.
+    # Vigencia del contrato (para × meses/días); no define el mes del gráfico.
     start = sub["start_date"] if "start_date" in sub.columns else sub["create_date"]
     start = start.fillna(sub["create_date"])
     if "first_contract_date" in sub.columns:
@@ -201,9 +213,12 @@ def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
     mrr = pd.to_numeric(sub.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
     untaxed = pd.to_numeric(sub.get("amount_untaxed", 0), errors="coerce").fillna(0.0)
 
-    sub["meses_contrato"] = [contract_months(s, e) for s, e in zip(start, end)]
+    dur = [contract_duration(s, e) for s, e in zip(start, end)]
+    sub["meses_contrato"] = [d[0] for d in dur]
+    sub["dias_contrato"] = [d[1] for d in dur]
     # Sin MRR (venta puntual / sin plan): 1 mes y valor = amount_untaxed.
     sub.loc[mrr <= 0, "meses_contrato"] = 1
+    sub.loc[mrr <= 0, "dias_contrato"] = 0
     sub["valor_vendido"] = [
         valor_vendido_contrato(m, s, e, u)
         for m, s, e, u in zip(mrr, start, end, untaxed)
@@ -234,7 +249,7 @@ def staff_cierre_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | Non
                          months: list[str], team_id: int | None = None,
                          logs: pd.DataFrame | None = None,
                          plans: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Cierre comercial = MRR × duración del contrato en el mes de create_date."""
+    """Cierre comercial = MRR×meses + (MRR/30)×días en el mes de create_date."""
     if subs is not None and not subs.empty:
         out = subscription_cierre_from_subs(subs, months, team_id=team_id, plans=plans)
         if float(out["vendido"].sum()) > 0:
@@ -248,6 +263,7 @@ __all__ = [
     "load_sale_order_log_report",
     "load_subscription_plans",
     "plan_period_months",
+    "contract_duration",
     "contract_months",
     "valor_vendido_contrato",
     "log_cierre_monthly",

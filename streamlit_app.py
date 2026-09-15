@@ -67,7 +67,7 @@ st.set_page_config(
 
 # Vendido (Formación / Fábrica) = amount_untaxed_company (COP, OV + TRM).
 # Vendido Staff (KPI período) = total con recurrencia: MRR × meses de vigencia.
-# Cierre Staff (gráfico mes a mes) = MRR × meses del contrato en mes de create_date.
+# Cierre Staff (gráfico mes a mes) = MRR×meses + (MRR/30)×días en mes de create_date.
 # Facturado = amount_untaxed_signed → base imponible en COP compañía
 # (Odoo ya convierte USD→COP al contabilizar). NC restan.
 # amount_untaxed_in_currency_signed se muestra solo en debug (moneda documento).
@@ -611,7 +611,7 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
             )
             det = staff_cierre_detail(subs_df, team_id=staff_team_id)
             if det is not None and not det.empty:
-                from mrr_cierre import contract_months, valor_vendido_contrato
+                from mrr_cierre import contract_duration, valor_vendido_contrato
                 det = det.copy()
                 if "create_date" not in det.columns:
                     det["create_date"] = pd.NaT
@@ -625,7 +625,9 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                 start_s = start_s.fillna(det["create_date"])
                 end_s = det["end_date"] if "end_date" in det.columns else pd.Series(pd.NaT, index=det.index)
                 mrr = pd.to_numeric(det.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
-                det["meses_contrato"] = [contract_months(s, e) for s, e in zip(start_s, end_s)]
+                dur = [contract_duration(s, e) for s, e in zip(start_s, end_s)]
+                det["meses_contrato"] = [d[0] for d in dur]
+                det["dias_contrato"] = [d[1] for d in dur]
                 untaxed = pd.to_numeric(det.get("amount_untaxed", 0), errors="coerce").fillna(0.0)
                 det["valor_vendido"] = [
                     valor_vendido_contrato(m, s, e, u)
@@ -633,13 +635,13 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                 ]
                 cols = [c for c in [
                     "name", "cliente", "create_date", "mes",
-                    "start_date", "end_date", "meses_contrato",
+                    "start_date", "end_date", "meses_contrato", "dias_contrato",
                     "recurring_monthly", "amount_untaxed", "valor_vendido", "plan", "equipo", "subscription_state",
                 ] if c in det.columns]
                 st.caption(
-                    "En el mes de **`create_date`** de la OV: Valor vendido = "
-                    "**MRR × meses completos** (duración real inicio→fin; p.ej. 8-sep→16-dic = 3, no 4). "
-                    "Ej. 8M × 3 meses = 24M. Sin fecha fin = 1 mes. Sin MRR (venta puntual/cancelada sin plan) = `amount_untaxed`. "
+                    "En el mes de **`create_date`**: "
+                    "**MRR × meses + (MRR/30) × días** (inicio→fin). "
+                    "Ej. 10M × 3 + 10M/30 × 7. Sin fecha fin = 1 mes. Sin MRR = `amount_untaxed`. "
                     f"Suma del período: {fmt_money(staff_cierre_anual)}."
                 )
                 st.dataframe(
@@ -648,6 +650,7 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                     column_config={
                         "recurring_monthly": st.column_config.NumberColumn("MRR / mes", format="%,.0f"),
                         "meses_contrato": st.column_config.NumberColumn("Meses", format="%d"),
+                        "dias_contrato": st.column_config.NumberColumn("Días", format="%d"),
                         "valor_vendido": st.column_config.NumberColumn("Vendido", format="%,.0f"),
                     },
                 )
@@ -759,7 +762,7 @@ with tab_resumen:
         f"**Vendido Staff (KPI):** valor suscripción × plan recurrente "
         f"(Recurrente × meses vigentes; `{staff_vendido_fuente}`). "
         f"**Cierre Staff (contratos nuevos):** {fmt_money(staff_cierre_anual)} = "
-        f"MRR × meses del contrato (mes de create_date). "
+        f"MRR × meses + (MRR/30)×días (mes de create_date). "
         f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {periodo_label} · "
         f"Confirmado · Importe sin impuestos. "
         f"**Facturado:** `account.move.line` publicadas · tipo **product** · "
