@@ -67,7 +67,7 @@ st.set_page_config(
 
 # Vendido (Formación / Fábrica) = amount_untaxed_company (COP, OV + TRM).
 # Vendido Staff (KPI período) = total con recurrencia: MRR × meses de vigencia.
-# Cierre Staff (gráfico mes a mes) = MRR×meses + (MRR/30)×días en mes de create_date.
+# Cierre Staff (gráfico mes a mes) = MRR × ciclos mensuales (aniversarios) en create_date.
 # Facturado = amount_untaxed_signed → base imponible en COP compañía
 # (Odoo ya convierte USD→COP al contabilizar). NC restan.
 # amount_untaxed_in_currency_signed se muestra solo en debug (moneda documento).
@@ -639,9 +639,11 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                     "recurring_monthly", "amount_untaxed", "valor_vendido", "plan", "equipo", "subscription_state",
                 ] if c in det.columns]
                 st.caption(
-                    "En el mes de **`create_date`**: "
-                    "**MRR × meses + (MRR/30) × días** (inicio→fin). "
-                    "Ej. 10M × 3 + 10M/30 × 7. Sin fecha fin = 1 mes. Sin MRR = `amount_untaxed`. "
+                    "En el mes de **`create_date`**: **MRR × ciclos mensuales** "
+                    "(aniversarios del día de inicio ≤ fecha fin). "
+                    "Ej. 11-ago→16-oct = 11-ago, 11-sep, 11-oct → 3 × 8M = 24M. "
+                    "Los días tras el último aniversario ya van en ese ciclo (no se suman aparte). "
+                    "Sin fecha fin = 1 ciclo. Sin MRR = `amount_untaxed`. "
                     f"Suma del período: {fmt_money(staff_cierre_anual)}."
                 )
                 st.dataframe(
@@ -762,7 +764,7 @@ with tab_resumen:
         f"**Vendido Staff (KPI):** valor suscripción × plan recurrente "
         f"(Recurrente × meses vigentes; `{staff_vendido_fuente}`). "
         f"**Cierre Staff (contratos nuevos):** {fmt_money(staff_cierre_anual)} = "
-        f"MRR × meses + (MRR/30)×días (mes de create_date). "
+        f"MRR × ciclos mensuales (aniversarios start→end, mes create_date). "
         f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {periodo_label} · "
         f"Confirmado · Importe sin impuestos. "
         f"**Facturado:** `account.move.line` publicadas · tipo **product** · "

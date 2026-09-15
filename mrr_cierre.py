@@ -2,17 +2,17 @@
 """Cierre Staff — valor vendido en el mes de create_date de la OV.
 
 Regla de negocio (ventas recurrentes):
-  En el mes de creación de la orden se toma el valor mensual (MRR) y *hasta cuándo va*
-  la suscripción. Ese producto es lo vendido.
+  En el mes de creación de la orden: MRR × *ciclos de facturación mensual*
+  desde start_date hasta end_date (aniversarios del día de inicio que caen
+  en o antes del fin).
 
-  Valor = MRR × meses completos + (MRR / 30) × días sueltos
-  (duración real start_date → end_date; no meses de calendario inclusivos).
+  Ejemplos:
+    - 11-ago → 16-oct: aniversarios 11-ago, 11-sep, 11-oct → 3 × 8M = 24M
+      (oportunidad «× 3 meses»; los días tras el 11-oct quedan dentro del 3.er ciclo)
+    - 8-sep → 15-dic: 8-sep, 8-oct, 8-nov, 8-dic → 4 × MRR
+      (oportunidades Cuántico «4 meses»)
 
-  Ejemplos (8-sep → 15-dic = 3 meses + 7 días):
-    - 10.000.000 × 3 + 10.000.000/30 × 7  →  32.333.333
-    -  4.800.000 × 3 +  4.800.000/30 × 7  →  15.520.000
-
-  Sin fecha fin → 1 mes (solo MRR).
+  Sin fecha fin → 1 ciclo (solo MRR).
   Sin MRR / sin plan recurrente → amount_untaxed (venta puntual, p.ej. 7M).
 """
 
@@ -35,9 +35,14 @@ from odoo_io import (
 
 
 def contract_duration(start, end) -> tuple[int, int]:
-    """(meses_completos, días_sueltos) entre start y end.
+    """(ciclos_mensuales, días_dentro_del_último_ciclo).
 
-    Sin fin o sin inicio → (1, 0) = un mes cerrado.
+    Ciclos = cuántos aniversarios mensuales de `start` caen en [start, end].
+    Los días sueltos tras el último aniversario ya están cubiertos por ese ciclo
+    (no se prorratean encima del MRR × ciclos).
+
+    11-ago → 16-oct → (3, 5);  8-sep → 15-dic → (4, 7).
+    Sin fin → (1, 0).
     """
     if pd.isna(start):
         return 1, 0
@@ -48,27 +53,33 @@ def contract_duration(start, end) -> tuple[int, int]:
     if e < s:
         return 1, 0
     if e == s:
-        return 0, 1
-    rd = relativedelta(e.to_pydatetime(), s.to_pydatetime())
-    months = int(rd.years * 12 + rd.months)
-    days = int(rd.days)
-    if months == 0 and days == 0:
-        return 0, 1
-    return months, days
+        return 1, 0
+
+    cycles = 0
+    # Límite de seguridad (contratos muy largos / datos raros)
+    for n in range(0, 600):
+        anniversary = s + relativedelta(months=n)
+        if anniversary > e:
+            break
+        cycles = n + 1
+    if cycles <= 0:
+        return 1, 0
+
+    last = s + relativedelta(months=cycles - 1)
+    days_in_last = max(int((e - last).days), 0)
+    return cycles, days_in_last
 
 
 def contract_months(start, end) -> int:
-    """Meses completos (compat). Sin fin → 1."""
-    months, days = contract_duration(start, end)
-    if months == 0 and days > 0:
-        return 0
-    return max(months, 1) if months == 0 and days == 0 else months
+    """Ciclos mensuales (compat). Sin fin → 1."""
+    months, _days = contract_duration(start, end)
+    return max(months, 1)
 
 
 def valor_vendido_contrato(mrr, start, end, amount_untaxed=0.0) -> float:
     """Valor vendido en el mes de create_date.
 
-    - Con MRR: MRR × meses + (MRR / 30) × días.
+    - Con MRR: MRR × ciclos de facturación (aniversarios start→end).
     - Sin plan / MRR=0 (venta puntual p.ej. 7M un mes): amount_untaxed.
     """
     try:
@@ -80,8 +91,8 @@ def valor_vendido_contrato(mrr, start, end, amount_untaxed=0.0) -> float:
     except (TypeError, ValueError):
         untaxed = 0.0
     if m > 0:
-        months, days = contract_duration(start, end)
-        return m * months + (m / 30.0) * days
+        months, _days = contract_duration(start, end)
+        return m * months
     # Sin recurrente: la venta puntual (1 mes o lo que diga el pedido).
     return max(untaxed, 0.0)
 
@@ -180,7 +191,7 @@ def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
     """Suma en el mes de create_date: MRR × meses + (MRR/30) × días."""
     from odoo_io import _subscription_cierre_frame
 
-    fuente = "MRR × meses + (MRR/30)×días (mes create_date)"
+    fuente = "MRR × ciclos mensuales (aniversarios start→end)"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -249,7 +260,7 @@ def staff_cierre_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | Non
                          months: list[str], team_id: int | None = None,
                          logs: pd.DataFrame | None = None,
                          plans: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Cierre comercial = MRR×meses + (MRR/30)×días en el mes de create_date."""
+    """Cierre comercial = MRR × ciclos mensuales en el mes de create_date."""
     if subs is not None and not subs.empty:
         out = subscription_cierre_from_subs(subs, months, team_id=team_id, plans=plans)
         if float(out["vendido"].sum()) > 0:
