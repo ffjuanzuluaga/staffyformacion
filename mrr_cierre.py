@@ -9,7 +9,9 @@ Regla de negocio (ventas recurrentes):
     - 8.000.000 / mes × 3 meses  →  24.000.000 en el mes de create_date
     - 14.000.000 / mes × 1 mes   →  14.000.000 en el mes de create_date
 
-  Meses = de start_date a end_date (inclusive).
+  Meses = duración real start_date → end_date (meses completos).
+  Ej. 8-sep → 16-dic = 3 meses (+ días sueltos; no cuentan como 4º mes).
+  No se usan meses de calendario inclusivos (eso contaría sep+oct+nov+dic = 4).
   Sin fecha fin → 1 mes.
   Sin MRR / sin plan recurrente → amount_untaxed (venta puntual, p.ej. 7M).
 """
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import pandas as pd
 import streamlit as st
+from dateutil.relativedelta import relativedelta
 
 from odoo_io import (
     _models_exist,
@@ -32,22 +35,29 @@ from odoo_io import (
 
 
 def contract_months(start, end) -> int:
-    """Meses de duración inclusive (start→end). Sin fin → 1."""
+    """Meses completos entre start y end (duración real, no calendario inclusivo).
+
+    8-sep → 16-dic → 3 (quedan ~8 días sueltos; no suman otro mes).
+    Sin fin o vigencia < 1 mes completo → 1.
+    """
     if pd.isna(start):
         return 1
-    start_p = pd.Period(start, freq="M")
+    s = pd.Timestamp(start).normalize()
     if pd.isna(end):
         return 1
-    end_p = pd.Period(end, freq="M")
-    if end_p < start_p:
+    e = pd.Timestamp(end).normalize()
+    if e < s:
         return 1
-    return int((end_p - start_p).n) + 1
+    rd = relativedelta(e.to_pydatetime(), s.to_pydatetime())
+    months = int(rd.years * 12 + rd.months)
+    # Contrato corto (< 1 mes completo) o solo días sueltos: cuenta 1.
+    return max(months, 1)
 
 
 def valor_vendido_contrato(mrr, start, end, amount_untaxed=0.0) -> float:
-    """Valor vendido en la fecha del contrato.
+    """Valor vendido en el mes de create_date.
 
-    - Con MRR (plan recurrente): MRR × meses (inicio→fin).
+    - Con MRR (plan recurrente): MRR × meses completos (inicio→fin).
     - Sin plan / MRR=0 (venta puntual p.ej. 7M un mes): amount_untaxed.
     """
     try:
