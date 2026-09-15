@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
-_DATA_VERSION = 21
+_DATA_VERSION = 22
 
 
 def allowed_team_ids() -> set[int]:
@@ -1028,12 +1028,12 @@ def load_staffing_renewals(date_from: str, date_to: str):
 def load_subscriptions(team_id: int | None):
     wanted = [
         "name", "partner_id", "subscription_state", "state", "start_date", "end_date",
-        "first_contract_date", "origin_order_id", "team_id", "next_invoice_date",
+        "first_contract_date", "create_date", "origin_order_id", "team_id", "next_invoice_date",
         "recurring_monthly", "recurring_total", "plan_id", "staff_request_id", "user_id",
         "amount_untaxed", "currency_id", "currency_rate", "is_subscription", "date_order",
     ]
     have = available_fields("sale.order")
-    # Incluir suscripciones del equipo Y pedidos Staff con first_contract_date
+    # Incluir suscripciones del equipo Y pedidos Staff con create_date / first_contract_date
     # (venta puntual tras cancelar plan recurrente, p.ej. 7M un mes).
     parts = []
     if "is_subscription" in have:
@@ -1046,11 +1046,9 @@ def load_subscriptions(team_id: int | None):
             parts.append([("plan_id", "!=", False), ("team_id", "=", team_id)])
         else:
             parts.append([("plan_id", "!=", False)])
-    if "first_contract_date" in have and team_id:
-        parts.append([
-            ("team_id", "=", team_id),
-            ("first_contract_date", "!=", False),
-        ])
+    if team_id:
+        # Pedidos Staff del equipo (cierre por create_date), con o sin plan recurrente.
+        parts.append([("team_id", "=", team_id), ("state", "in", ["sale", "done", "cancel"])])
     if "staff_request_id" in have:
         parts.append([("staff_request_id", "!=", False)])
 
@@ -1085,17 +1083,21 @@ def load_subscriptions(team_id: int | None):
     df["cliente"] = m2o_name(df["partner_id"])
     df["start_date"] = pd.to_datetime(df["start_date"], errors="coerce")
     df["end_date"] = pd.to_datetime(df["end_date"], errors="coerce")
+    if "create_date" in df.columns:
+        df["create_date"] = pd.to_datetime(df["create_date"], errors="coerce")
+    else:
+        df["create_date"] = pd.NaT
     if "first_contract_date" in df.columns:
         df["first_contract_date"] = pd.to_datetime(df["first_contract_date"], errors="coerce")
     else:
-        # Sin el campo no inventamos con start_date (renovaciones sesgarían el cierre).
         df["first_contract_date"] = pd.NaT
-    # Si cancelaron la suscripción pero dejaron OV de 1 mes sin first_contract_date,
-    # usar date_order como fecha de cierre comercial.
     if "date_order" in df.columns:
         df["date_order"] = pd.to_datetime(df["date_order"], errors="coerce")
-        miss_fcd = df["first_contract_date"].isna()
-        df.loc[miss_fcd, "first_contract_date"] = df.loc[miss_fcd, "date_order"]
+    else:
+        df["date_order"] = pd.NaT
+    # Fecha de cierre comercial del gráfico = create_date (fallback date_order).
+    miss_cd = df["create_date"].isna()
+    df.loc[miss_cd, "create_date"] = df.loc[miss_cd, "date_order"]
     if "next_invoice_date" in df:
         df["next_invoice_date"] = pd.to_datetime(df["next_invoice_date"], errors="coerce")
     df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
@@ -1316,11 +1318,16 @@ def _subscription_cierre_frame(subs: pd.DataFrame, team_id: int | None = None) -
         # Nunca renovaciones / upsell / draft
         drop = st_col.isin(SUB_CIERRE_EXCLUDE)
         sub = sub[keep & ~drop]
-    # Pedido cancelado en Odoo: igual cuenta la venta si tiene first_contract_date.
+    # Pedido cancelado en Odoo: igual cuenta la venta si tiene create_date.
     # (no filtramos state=cancel)
-    if "first_contract_date" not in sub.columns:
+    if "create_date" not in sub.columns and "date_order" not in sub.columns:
         return pd.DataFrame()
-    sub = sub[sub["first_contract_date"].notna()].copy()
+    if "create_date" not in sub.columns:
+        sub["create_date"] = pd.NaT
+    if "date_order" in sub.columns:
+        miss = sub["create_date"].isna()
+        sub.loc[miss, "create_date"] = sub.loc[miss, "date_order"]
+    sub = sub[sub["create_date"].notna()].copy()
     if sub.empty:
         return sub
 

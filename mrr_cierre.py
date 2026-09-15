@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Cierre Staff — valor vendido en la fecha del primer contrato.
+"""Cierre Staff — valor vendido en el mes de create_date de la OV.
 
 Regla de negocio (ventas recurrentes):
-  En la fecha del contrato se toma el valor mensual (MRR) y *hasta cuándo va*
+  En el mes de creación de la orden se toma el valor mensual (MRR) y *hasta cuándo va*
   la suscripción. Ese producto es lo vendido.
 
   Ejemplos:
-    - 8.000.000 / mes × 3 meses  →  24.000.000 en el mes del contrato
-    - 14.000.000 / mes × 1 mes   →  14.000.000 en el mes del contrato
+    - 8.000.000 / mes × 3 meses  →  24.000.000 en el mes de create_date
+    - 14.000.000 / mes × 1 mes   →  14.000.000 en el mes de create_date
 
   Meses = de start_date a end_date (inclusive).
   Sin fecha fin → 1 mes.
@@ -155,10 +155,10 @@ def plan_period_months(value, unit) -> float:
 def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
                                   team_id: int | None = None,
                                   plans: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Suma en el mes de first_contract_date: MRR × meses (start→end)."""
+    """Suma en el mes de create_date: MRR × meses (start→end)."""
     from odoo_io import _subscription_cierre_frame
 
-    fuente = "MRR × meses del contrato (fecha primer contrato → fin)"
+    fuente = "MRR × meses del contrato (mes de create_date de la OV)"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -168,18 +168,25 @@ def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
     if sub.empty:
         return empty
     sub = sub.copy()
-    sub = sub[sub["first_contract_date"].notna()].copy()
+    if "create_date" not in sub.columns:
+        sub["create_date"] = pd.NaT
+    if "date_order" in sub.columns:
+        miss = sub["create_date"].isna()
+        sub.loc[miss, "create_date"] = sub.loc[miss, "date_order"]
+    sub = sub[sub["create_date"].notna()].copy()
     if sub.empty:
         return empty
 
-    sub["mes"] = sub["first_contract_date"].dt.to_period("M").astype(str)
+    sub["mes"] = sub["create_date"].dt.to_period("M").astype(str)
     sub = sub[sub["mes"].isin(months)].copy()
     if sub.empty:
         return empty
 
-    # Inicio de vigencia: start_date, si falta first_contract_date
-    start = sub["start_date"] if "start_date" in sub.columns else sub["first_contract_date"]
-    start = start.fillna(sub["first_contract_date"])
+    # Vigencia del contrato (para × meses); no define el mes del gráfico.
+    start = sub["start_date"] if "start_date" in sub.columns else sub["create_date"]
+    start = start.fillna(sub["create_date"])
+    if "first_contract_date" in sub.columns:
+        start = start.fillna(sub["first_contract_date"])
     end = sub["end_date"] if "end_date" in sub.columns else pd.Series(pd.NaT, index=sub.index)
     mrr = pd.to_numeric(sub.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
     untaxed = pd.to_numeric(sub.get("amount_untaxed", 0), errors="coerce").fillna(0.0)
@@ -217,7 +224,7 @@ def staff_cierre_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | Non
                          months: list[str], team_id: int | None = None,
                          logs: pd.DataFrame | None = None,
                          plans: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Cierre comercial = MRR × duración del contrato en el mes del primer contrato."""
+    """Cierre comercial = MRR × duración del contrato en el mes de create_date."""
     if subs is not None and not subs.empty:
         out = subscription_cierre_from_subs(subs, months, team_id=team_id, plans=plans)
         if float(out["vendido"].sum()) > 0:
