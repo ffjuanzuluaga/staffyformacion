@@ -67,7 +67,7 @@ st.set_page_config(
 
 # Vendido (Formación / Fábrica) = amount_untaxed_company (COP, OV + TRM).
 # Vendido Staff (KPI período) = total con recurrencia: MRR × meses de vigencia.
-# Cierre Staff (gráfico mes a mes) = MRR×ciclos + (MRR/30)×días en create_date.
+# Cierre Staff (gráfico mes a mes) = expected_revenue de la oportunidad en create_date.
 # Facturado = amount_untaxed_signed → base imponible en COP compañía
 # (Odoo ya convierte USD→COP al contabilizar). NC restan.
 # amount_untaxed_in_currency_signed se muestra solo en debug (moneda documento).
@@ -419,7 +419,7 @@ def chart_venta_vs_meta(linea: str, sales: pd.DataFrame):
     meta_m = meta_anual_de(metas_lineas, linea) / 12
     if linea == "Staff":
         scol = STAFF_VENDIDO_COL
-        titulo = f"{linea} — cierre (MRR × meses · mes create_date) vs. meta ({periodo_label})"
+        titulo = f"{linea} — cierre (valor oportunidad · mes create_date) vs. meta ({periodo_label})"
         ventas_mes = (
             sales.groupby("mes", as_index=False)[scol].sum()
             if sales is not None and not sales.empty and scol in sales
@@ -566,7 +566,7 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
             f"**Vendido Staff (KPI de arriba)** = valor mensual de la plaza × meses vigentes "
             f"(equivalente a suscripción × plan mensual; fuente: `{staff_vendido_fuente}`). "
             f"Hoy: {fmt_money(staff_vendido_anual)}. "
-            f"**Cierre del período** (mes de `create_date` de la OV: valor mensual × meses hasta el fin): "
+            f"**Cierre del período** (mes de `create_date`: ingreso esperado de la oportunidad): "
             f"{fmt_money(staff_cierre_anual)} (`{staff_cierre_fuente}`). "
             f"Ej.: 8M × 3 meses = 24M; si dura 1 mes = solo ese valor. "
             f"**Facturado** = líneas de asiento `display_type=product` (−`balance` COP)."
@@ -599,7 +599,7 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                 f"Suma anual (KPI de arriba): {fmt_money(staff_vendido_anual)}. "
                 "Con plan mensual: cada mes vigente suma el Recurrente de la suscripción."
             )
-        with st.expander("Detalle cierre Staff (MRR × meses · create_date)"):
+        with st.expander("Detalle cierre Staff (valor oportunidad · create_date)"):
             st.dataframe(
                 staff_cierre_mes,
                 use_container_width=True, hide_index=True,
@@ -629,26 +629,27 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                 det["meses_contrato"] = [d[0] for d in dur]
                 det["dias_contrato"] = [d[1] for d in dur]
                 untaxed = pd.to_numeric(det.get("amount_untaxed", 0), errors="coerce").fillna(0.0)
+                opp = pd.to_numeric(det.get("expected_revenue", 0), errors="coerce").fillna(0.0)
                 det["valor_vendido"] = [
-                    valor_vendido_contrato(m, s, e, u)
-                    for m, s, e, u in zip(mrr, start_s, end_s, untaxed)
+                    valor_vendido_contrato(m, s, e, u, o)
+                    for m, s, e, u, o in zip(mrr, start_s, end_s, untaxed, opp)
                 ]
                 cols = [c for c in [
-                    "name", "cliente", "create_date", "mes",
+                    "name", "cliente", "oportunidad", "expected_revenue", "create_date", "mes",
                     "start_date", "end_date", "meses_contrato", "dias_contrato",
                     "recurring_monthly", "amount_untaxed", "valor_vendido", "plan", "equipo", "subscription_state",
                 ] if c in det.columns]
                 st.caption(
-                    "En el mes de **`create_date`**: **MRR × ciclos + (MRR/30) × días** "
-                    "(aniversarios del inicio ≤ fin, más días tras el último). "
-                    "Ej. 11-ago→16-oct = 3 ciclos + 5 días → 8M×3 + 8M/30×5. "
-                    "Sin fecha fin = 1 ciclo. Sin MRR = `amount_untaxed`. "
+                    "En el mes de **`create_date`**: valor = **`expected_revenue`** de la oportunidad "
+                    "(`crm.lead`). Si no hay oportunidad/ingresos esperados, fallback "
+                    "MRR×ciclos+(MRR/30)×días o `amount_untaxed`. "
                     f"Suma del período: {fmt_money(staff_cierre_anual)}."
                 )
                 st.dataframe(
                     det[cols].sort_values("create_date"),
                     use_container_width=True, hide_index=True,
                     column_config={
+                        "expected_revenue": st.column_config.NumberColumn("Ingreso esperado (opp)", format="%,.0f"),
                         "recurring_monthly": st.column_config.NumberColumn("MRR / mes", format="%,.0f"),
                         "meses_contrato": st.column_config.NumberColumn("Meses", format="%d"),
                         "dias_contrato": st.column_config.NumberColumn("Días", format="%d"),
@@ -763,7 +764,7 @@ with tab_resumen:
         f"**Vendido Staff (KPI):** valor suscripción × plan recurrente "
         f"(Recurrente × meses vigentes; `{staff_vendido_fuente}`). "
         f"**Cierre Staff (contratos nuevos):** {fmt_money(staff_cierre_anual)} = "
-        f"MRR × ciclos + (MRR/30)×días (mes de create_date). "
+        f"`expected_revenue` de la oportunidad (mes de create_date; fallback MRR si falta). "
         f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {periodo_label} · "
         f"Confirmado · Importe sin impuestos. "
         f"**Facturado:** `account.move.line` publicadas · tipo **product** · "

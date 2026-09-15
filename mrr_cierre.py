@@ -1,19 +1,15 @@
 # -*- coding: utf-8 -*-
 """Cierre Staff — valor vendido en el mes de create_date de la OV.
 
-Regla de negocio (ventas recurrentes):
-  Valor = MRR × ciclos mensuales + (MRR / 30) × días tras el último aniversario.
+Regla de negocio:
+  Valor = `expected_revenue` de la oportunidad CRM (`sale.order.opportunity_id`).
+  Mes del gráfico = create_date de la OV.
 
-  Ciclos = aniversarios del día de inicio que caen en o antes de end_date.
+  Fallback si no hay oportunidad / expected_revenue=0:
+    MRR × ciclos mensuales + (MRR/30) × días (aniversarios start→end),
+    o amount_untaxed si no hay MRR.
 
-  Ejemplos:
-    - 11-ago → 16-oct: ciclos 11-ago, 11-sep, 11-oct (3) + 5 días
-      → 8M × 3 + 8M/30 × 5 = 25.333.333
-    - 8-sep → 15-dic: 4 ciclos + 7 días
-      → MRR × 4 + (MRR/30) × 7
-
-  Sin fecha fin → 1 ciclo (solo MRR).
-  Sin MRR / sin plan recurrente → amount_untaxed (venta puntual, p.ej. 7M).
+  Ej. oportunidad «4 meses × 10M» con expected_revenue=40M → 40M en create_date.
 """
 
 from __future__ import annotations
@@ -35,7 +31,7 @@ from odoo_io import (
 
 
 def contract_duration(start, end) -> tuple[int, int]:
-    """(ciclos_mensuales, días_tras_último_aniversario).
+    """(ciclos_mensuales, días_tras_último_aniversario). Fallback MRR.
 
     11-ago → 16-oct → (3, 5);  8-sep → 15-dic → (4, 7).
     Sin fin → (1, 0).
@@ -71,12 +67,19 @@ def contract_months(start, end) -> int:
     return max(months, 1)
 
 
-def valor_vendido_contrato(mrr, start, end, amount_untaxed=0.0) -> float:
+def valor_vendido_contrato(mrr, start, end, amount_untaxed=0.0,
+                           expected_revenue=0.0) -> float:
     """Valor vendido en el mes de create_date.
 
-    - Con MRR: MRR × ciclos + (MRR / 30) × días.
-    - Sin plan / MRR=0 (venta puntual p.ej. 7M un mes): amount_untaxed.
+    Preferencia: expected_revenue de la oportunidad → MRR×ciclos+(MRR/30)×días
+    → amount_untaxed.
     """
+    try:
+        opp = float(expected_revenue) if expected_revenue is not None and not pd.isna(expected_revenue) else 0.0
+    except (TypeError, ValueError):
+        opp = 0.0
+    if opp > 0:
+        return opp
     try:
         m = float(mrr) if mrr is not None and not pd.isna(mrr) else 0.0
     except (TypeError, ValueError):
@@ -182,10 +185,10 @@ def plan_period_months(value, unit) -> float:
 def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
                                   team_id: int | None = None,
                                   plans: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Suma en el mes de create_date: MRR × meses + (MRR/30) × días."""
+    """Suma en el mes de create_date: expected_revenue de la oportunidad."""
     from odoo_io import _subscription_cierre_frame
 
-    fuente = "MRR × ciclos + (MRR/30)×días (mes create_date)"
+    fuente = "crm.lead.expected_revenue (oportunidad · mes create_date)"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -209,7 +212,6 @@ def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
     if sub.empty:
         return empty
 
-    # Vigencia del contrato (para × meses/días); no define el mes del gráfico.
     start = sub["start_date"] if "start_date" in sub.columns else sub["create_date"]
     start = start.fillna(sub["create_date"])
     if "first_contract_date" in sub.columns:
@@ -217,17 +219,21 @@ def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
     end = sub["end_date"] if "end_date" in sub.columns else pd.Series(pd.NaT, index=sub.index)
     mrr = pd.to_numeric(sub.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
     untaxed = pd.to_numeric(sub.get("amount_untaxed", 0), errors="coerce").fillna(0.0)
+    opp = pd.to_numeric(sub.get("expected_revenue", 0), errors="coerce").fillna(0.0)
 
     dur = [contract_duration(s, e) for s, e in zip(start, end)]
     sub["meses_contrato"] = [d[0] for d in dur]
     sub["dias_contrato"] = [d[1] for d in dur]
-    # Sin MRR (venta puntual / sin plan): 1 mes y valor = amount_untaxed.
-    sub.loc[mrr <= 0, "meses_contrato"] = 1
-    sub.loc[mrr <= 0, "dias_contrato"] = 0
     sub["valor_vendido"] = [
-        valor_vendido_contrato(m, s, e, u)
-        for m, s, e, u in zip(mrr, start, end, untaxed)
+        valor_vendido_contrato(m, s, e, u, o)
+        for m, s, e, u, o in zip(mrr, start, end, untaxed, opp)
     ]
+    # Marcar fuente mixta si alguna fila usó fallback.
+    used_opp = int((opp > 0).sum())
+    if used_opp == 0:
+        fuente = "fallback MRR×ciclos+(MRR/30)×días (sin expected_revenue)"
+    elif used_opp < len(sub):
+        fuente = "crm.lead.expected_revenue (+ fallback MRR si falta opp)"
 
     por_mes = (
         sub.groupby("mes", as_index=False)["valor_vendido"]
@@ -254,7 +260,7 @@ def staff_cierre_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | Non
                          months: list[str], team_id: int | None = None,
                          logs: pd.DataFrame | None = None,
                          plans: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Cierre comercial = MRR×ciclos + (MRR/30)×días en el mes de create_date."""
+    """Cierre comercial = expected_revenue de la oportunidad (mes create_date)."""
     if subs is not None and not subs.empty:
         out = subscription_cierre_from_subs(subs, months, team_id=team_id, plans=plans)
         if float(out["vendido"].sum()) > 0:
