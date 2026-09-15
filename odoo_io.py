@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
-_DATA_VERSION = 20
+_DATA_VERSION = 21
 
 
 def allowed_team_ids() -> set[int]:
@@ -1027,32 +1027,57 @@ def load_staffing_renewals(date_from: str, date_to: str):
 @st.cache_data(ttl=600, show_spinner="Cargando suscripciones de Staff...")
 def load_subscriptions(team_id: int | None):
     wanted = [
-        "name", "partner_id", "subscription_state", "start_date", "end_date",
+        "name", "partner_id", "subscription_state", "state", "start_date", "end_date",
         "first_contract_date", "origin_order_id", "team_id", "next_invoice_date",
         "recurring_monthly", "recurring_total", "plan_id", "staff_request_id", "user_id",
-        "amount_untaxed", "currency_id", "currency_rate",
+        "amount_untaxed", "currency_id", "currency_rate", "is_subscription", "date_order",
     ]
     have = available_fields("sale.order")
-    domain = []
+    # Incluir suscripciones del equipo Y pedidos Staff con first_contract_date
+    # (venta puntual tras cancelar plan recurrente, p.ej. 7M un mes).
+    parts = []
     if "is_subscription" in have:
-        domain.append(("is_subscription", "=", True))
+        if team_id:
+            parts.append([("is_subscription", "=", True), ("team_id", "=", team_id)])
+        else:
+            parts.append([("is_subscription", "=", True)])
     elif "plan_id" in have:
-        domain.append(("plan_id", "!=", False))
-    else:
+        if team_id:
+            parts.append([("plan_id", "!=", False), ("team_id", "=", team_id)])
+        else:
+            parts.append([("plan_id", "!=", False)])
+    if "first_contract_date" in have and team_id:
+        parts.append([
+            ("team_id", "=", team_id),
+            ("first_contract_date", "!=", False),
+        ])
+    if "staff_request_id" in have:
+        parts.append([("staff_request_id", "!=", False)])
+
+    if not parts:
         return pd.DataFrame(columns=wanted), (
             "Esta base no expone is_subscription ni plan_id en sale.order. "
             "Revisa que sale_subscription esté instalado."
         )
-    if team_id:
-        domain.append(("team_id", "=", team_id))
-    # (is_subscription AND team) OR staff_request — rescata plazas sin equipo asignado.
-    if "staff_request_id" in have:
-        domain = ["|", ("staff_request_id", "!=", False)] + (
-            ["&"] + domain if len(domain) > 1 else domain
-        )
+
+    # OR de todos los bloques
+    domain: list = []
+    if len(parts) == 1:
+        domain = parts[0]
+    else:
+        # ['|', '|', A..., '|', B..., C...] — n-1 pipes for n parts
+        domain = ["|"] * (len(parts) - 1)
+        for block in parts:
+            if len(block) > 1:
+                domain.extend(["&"] * (len(block) - 1))
+            domain.extend(block)
 
     try:
-        df = search_read("sale.order", domain, pick_fields("sale.order", wanted))
+        # active_test=False: no perder canceladas / archivadas que sí vendieron.
+        df = search_read(
+            "sale.order", domain, pick_fields("sale.order", wanted),
+            context={"active_test": False},
+        )
     except Exception as e:
         return pd.DataFrame(columns=wanted), f"No se pudo consultar suscripciones: {e}"
     if df.empty:
@@ -1065,6 +1090,12 @@ def load_subscriptions(team_id: int | None):
     else:
         # Sin el campo no inventamos con start_date (renovaciones sesgarían el cierre).
         df["first_contract_date"] = pd.NaT
+    # Si cancelaron la suscripción pero dejaron OV de 1 mes sin first_contract_date,
+    # usar date_order como fecha de cierre comercial.
+    if "date_order" in df.columns:
+        df["date_order"] = pd.to_datetime(df["date_order"], errors="coerce")
+        miss_fcd = df["first_contract_date"].isna()
+        df.loc[miss_fcd, "first_contract_date"] = df.loc[miss_fcd, "date_order"]
     if "next_invoice_date" in df:
         df["next_invoice_date"] = pd.to_datetime(df["next_invoice_date"], errors="coerce")
     df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
@@ -1080,6 +1111,9 @@ def load_subscriptions(team_id: int | None):
     mrr = pd.to_numeric(df.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
     if "recurring_monthly" not in df.columns:
         df["recurring_monthly"] = mrr
+    untaxed = pd.to_numeric(df.get("amount_untaxed", 0), errors="coerce").fillna(0.0)
+    if "amount_untaxed" not in df.columns:
+        df["amount_untaxed"] = untaxed
     rate = pd.to_numeric(df["currency_rate"], errors="coerce") if "currency_rate" in df else pd.Series(1.0, index=df.index)
     rate = rate.replace(0, pd.NA).fillna(1.0)
     company_cur = company_currency_id()
@@ -1255,14 +1289,18 @@ def staffing_pnl_monthly(requests: pd.DataFrame, months: list[str],
     return pd.DataFrame(rows)
 
 
-# Igual que la acción Suscripciones de Odoo 19 (excluye 5_renewed / 2_renewal / 7_upsell).
-# Si contáramos "Renovada" + "En progreso" del mismo contrato, el MRR se duplica.
+# Cierre comercial: incluye churn y canceladas (la venta ya ocurrió).
+# Excluye renovada / upsell / cotización para no duplicar la cadena.
 SUB_CIERRE_STATES = ("3_progress", "4_paused", "6_churn")
-SUB_CIERRE_STATE_RANK = {"3_progress": 0, "4_paused": 1, "6_churn": 2}
+SUB_CIERRE_EXCLUDE = ("2_renewal", "5_renewed", "7_upsell", "1_draft")
+SUB_CIERRE_STATE_RANK = {
+    "3_progress": 0, "4_paused": 1, "6_churn": 2,
+    False: 3, None: 3, "": 3,
+}
 
 
 def _subscription_cierre_frame(subs: pd.DataFrame, team_id: int | None = None) -> pd.DataFrame:
-    """Filtra como el listado de Suscripciones Odoo (equipo Staff + estados visibles)."""
+    """Pedidos Staff con fecha de primer contrato (incluye churn/canceladas / sin plan)."""
     if subs is None or subs.empty:
         return pd.DataFrame()
     sub = subs.copy()
@@ -1272,8 +1310,14 @@ def _subscription_cierre_frame(subs: pd.DataFrame, team_id: int | None = None) -
     elif "equipo" in sub.columns:
         sub = sub[sub["equipo"].map(linea_from_team_name) == "Staff"]
     if "subscription_state" in sub.columns:
-        sub = sub[sub["subscription_state"].isin(SUB_CIERRE_STATES)]
-    # Obligatorio first_contract_date (no usar start_date: las renovaciones moverían el mes).
+        st_col = sub["subscription_state"]
+        # Incluir estados de cierre + vacíos (p.ej. cancelada / sin plan recurrente).
+        keep = st_col.isin(SUB_CIERRE_STATES) | st_col.isna() | (st_col == False) | (st_col.astype(str).isin(["False", "", "None"]))
+        # Nunca renovaciones / upsell / draft
+        drop = st_col.isin(SUB_CIERRE_EXCLUDE)
+        sub = sub[keep & ~drop]
+    # Pedido cancelado en Odoo: igual cuenta la venta si tiene first_contract_date.
+    # (no filtramos state=cancel)
     if "first_contract_date" not in sub.columns:
         return pd.DataFrame()
     sub = sub[sub["first_contract_date"].notna()].copy()
@@ -1287,7 +1331,7 @@ def _subscription_cierre_frame(subs: pd.DataFrame, team_id: int | None = None) -
     else:
         chain = pd.to_numeric(sub["id"], errors="coerce")
     sub["_chain"] = chain
-    sub["_rank"] = sub["subscription_state"].map(SUB_CIERRE_STATE_RANK).fillna(9)
+    sub["_rank"] = sub["subscription_state"].map(SUB_CIERRE_STATE_RANK).fillna(5)
     sub = sub.sort_values(["_chain", "_rank", "id"])
     sub = sub.drop_duplicates(subset=["_chain"], keep="first")
     return sub.drop(columns=["_chain", "_rank"], errors="ignore")

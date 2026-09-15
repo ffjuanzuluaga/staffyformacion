@@ -10,7 +10,8 @@ Regla de negocio (ventas recurrentes):
     - 14.000.000 / mes × 1 mes   →  14.000.000 en el mes del contrato
 
   Meses = de start_date a end_date (inclusive).
-  Sin fecha fin → 1 mes (solo el valor de ese período).
+  Sin fecha fin → 1 mes.
+  Sin MRR / sin plan recurrente → amount_untaxed (venta puntual, p.ej. 7M).
 """
 
 from __future__ import annotations
@@ -43,15 +44,24 @@ def contract_months(start, end) -> int:
     return int((end_p - start_p).n) + 1
 
 
-def valor_vendido_contrato(mrr, start, end) -> float:
-    """MRR × meses hasta el fin del contrato."""
+def valor_vendido_contrato(mrr, start, end, amount_untaxed=0.0) -> float:
+    """Valor vendido en la fecha del contrato.
+
+    - Con MRR (plan recurrente): MRR × meses (inicio→fin).
+    - Sin plan / MRR=0 (venta puntual p.ej. 7M un mes): amount_untaxed.
+    """
     try:
         m = float(mrr) if mrr is not None and not pd.isna(mrr) else 0.0
     except (TypeError, ValueError):
         m = 0.0
-    if m <= 0:
-        return 0.0
-    return m * contract_months(start, end)
+    try:
+        untaxed = float(amount_untaxed) if amount_untaxed is not None and not pd.isna(amount_untaxed) else 0.0
+    except (TypeError, ValueError):
+        untaxed = 0.0
+    if m > 0:
+        return m * contract_months(start, end)
+    # Sin recurrente: la venta puntual (1 mes o lo que diga el pedido).
+    return max(untaxed, 0.0)
 
 
 # ── loaders de apoyo (detalle / planes) ──────────────────────────────
@@ -172,10 +182,14 @@ def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
     start = start.fillna(sub["first_contract_date"])
     end = sub["end_date"] if "end_date" in sub.columns else pd.Series(pd.NaT, index=sub.index)
     mrr = pd.to_numeric(sub.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
+    untaxed = pd.to_numeric(sub.get("amount_untaxed", 0), errors="coerce").fillna(0.0)
 
     sub["meses_contrato"] = [contract_months(s, e) for s, e in zip(start, end)]
+    # Sin MRR (venta puntual / sin plan): 1 mes y valor = amount_untaxed.
+    sub.loc[mrr <= 0, "meses_contrato"] = 1
     sub["valor_vendido"] = [
-        valor_vendido_contrato(m, s, e) for m, s, e in zip(mrr, start, end)
+        valor_vendido_contrato(m, s, e, u)
+        for m, s, e, u in zip(mrr, start, end, untaxed)
     ]
 
     por_mes = (

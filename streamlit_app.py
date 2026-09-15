@@ -621,18 +621,20 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                 end_s = det["end_date"] if "end_date" in det.columns else pd.Series(pd.NaT, index=det.index)
                 mrr = pd.to_numeric(det.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
                 det["meses_contrato"] = [contract_months(s, e) for s, e in zip(start_s, end_s)]
+                untaxed = pd.to_numeric(det.get("amount_untaxed", 0), errors="coerce").fillna(0.0)
                 det["valor_vendido"] = [
-                    valor_vendido_contrato(m, s, e) for m, s, e in zip(mrr, start_s, end_s)
+                    valor_vendido_contrato(m, s, e, u)
+                    for m, s, e, u in zip(mrr, start_s, end_s, untaxed)
                 ]
                 cols = [c for c in [
                     "name", "cliente", "first_contract_date", "mes",
                     "start_date", "end_date", "meses_contrato",
-                    "recurring_monthly", "valor_vendido", "plan", "equipo",
+                    "recurring_monthly", "amount_untaxed", "valor_vendido", "plan", "equipo", "subscription_state",
                 ] if c in det.columns]
                 st.caption(
                     "En la **fecha del primer contrato**: Valor vendido = "
                     "**MRR × meses** (desde inicio hasta fin del contrato). "
-                    "Ej. 8M × 3 meses = 24M. Sin fecha fin = 1 mes. "
+                    "Ej. 8M × 3 meses = 24M. Sin fecha fin = 1 mes. Sin MRR (venta puntual/cancelada sin plan) = `amount_untaxed`. "
                     f"Suma del período: {fmt_money(staff_cierre_anual)}."
                 )
                 st.dataframe(
