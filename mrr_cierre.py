@@ -2,15 +2,15 @@
 """Cierre Staff — valor vendido en el mes de create_date de la OV.
 
 Regla de negocio (ventas recurrentes):
-  En el mes de creación de la orden: MRR × *ciclos de facturación mensual*
-  desde start_date hasta end_date (aniversarios del día de inicio que caen
-  en o antes del fin).
+  Valor = MRR × ciclos mensuales + (MRR / 30) × días tras el último aniversario.
+
+  Ciclos = aniversarios del día de inicio que caen en o antes de end_date.
 
   Ejemplos:
-    - 11-ago → 16-oct: aniversarios 11-ago, 11-sep, 11-oct → 3 × 8M = 24M
-      (oportunidad «× 3 meses»; los días tras el 11-oct quedan dentro del 3.er ciclo)
-    - 8-sep → 15-dic: 8-sep, 8-oct, 8-nov, 8-dic → 4 × MRR
-      (oportunidades Cuántico «4 meses»)
+    - 11-ago → 16-oct: ciclos 11-ago, 11-sep, 11-oct (3) + 5 días
+      → 8M × 3 + 8M/30 × 5 = 25.333.333
+    - 8-sep → 15-dic: 4 ciclos + 7 días
+      → MRR × 4 + (MRR/30) × 7
 
   Sin fecha fin → 1 ciclo (solo MRR).
   Sin MRR / sin plan recurrente → amount_untaxed (venta puntual, p.ej. 7M).
@@ -35,11 +35,7 @@ from odoo_io import (
 
 
 def contract_duration(start, end) -> tuple[int, int]:
-    """(ciclos_mensuales, días_dentro_del_último_ciclo).
-
-    Ciclos = cuántos aniversarios mensuales de `start` caen en [start, end].
-    Los días sueltos tras el último aniversario ya están cubiertos por ese ciclo
-    (no se prorratean encima del MRR × ciclos).
+    """(ciclos_mensuales, días_tras_último_aniversario).
 
     11-ago → 16-oct → (3, 5);  8-sep → 15-dic → (4, 7).
     Sin fin → (1, 0).
@@ -56,7 +52,6 @@ def contract_duration(start, end) -> tuple[int, int]:
         return 1, 0
 
     cycles = 0
-    # Límite de seguridad (contratos muy largos / datos raros)
     for n in range(0, 600):
         anniversary = s + relativedelta(months=n)
         if anniversary > e:
@@ -66,8 +61,8 @@ def contract_duration(start, end) -> tuple[int, int]:
         return 1, 0
 
     last = s + relativedelta(months=cycles - 1)
-    days_in_last = max(int((e - last).days), 0)
-    return cycles, days_in_last
+    days_extra = max(int((e - last).days), 0)
+    return cycles, days_extra
 
 
 def contract_months(start, end) -> int:
@@ -79,7 +74,7 @@ def contract_months(start, end) -> int:
 def valor_vendido_contrato(mrr, start, end, amount_untaxed=0.0) -> float:
     """Valor vendido en el mes de create_date.
 
-    - Con MRR: MRR × ciclos de facturación (aniversarios start→end).
+    - Con MRR: MRR × ciclos + (MRR / 30) × días.
     - Sin plan / MRR=0 (venta puntual p.ej. 7M un mes): amount_untaxed.
     """
     try:
@@ -91,9 +86,8 @@ def valor_vendido_contrato(mrr, start, end, amount_untaxed=0.0) -> float:
     except (TypeError, ValueError):
         untaxed = 0.0
     if m > 0:
-        months, _days = contract_duration(start, end)
-        return m * months
-    # Sin recurrente: la venta puntual (1 mes o lo que diga el pedido).
+        months, days = contract_duration(start, end)
+        return m * months + (m / 30.0) * days
     return max(untaxed, 0.0)
 
 
@@ -191,7 +185,7 @@ def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
     """Suma en el mes de create_date: MRR × meses + (MRR/30) × días."""
     from odoo_io import _subscription_cierre_frame
 
-    fuente = "MRR × ciclos mensuales (aniversarios start→end)"
+    fuente = "MRR × ciclos + (MRR/30)×días (mes create_date)"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -260,7 +254,7 @@ def staff_cierre_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | Non
                          months: list[str], team_id: int | None = None,
                          logs: pd.DataFrame | None = None,
                          plans: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Cierre comercial = MRR × ciclos mensuales en el mes de create_date."""
+    """Cierre comercial = MRR×ciclos + (MRR/30)×días en el mes de create_date."""
     if subs is not None and not subs.empty:
         out = subscription_cierre_from_subs(subs, months, team_id=team_id, plans=plans)
         if float(out["vendido"].sum()) > 0:
