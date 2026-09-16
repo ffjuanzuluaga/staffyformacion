@@ -66,7 +66,7 @@ st.set_page_config(
 
 
 # Vendido (Formación / Fábrica) = amount_untaxed_company (COP, OV + TRM).
-# Vendido Staff (KPI período) = total con recurrencia: MRR × meses de vigencia.
+# Vendido Staff (KPI período) = expected_revenue de la oportunidad (igual que el cierre).
 # Cierre Staff (gráfico mes a mes) = expected_revenue de la oportunidad en create_date.
 # Facturado = amount_untaxed_signed → base imponible en COP compañía
 # (Odoo ya convierte USD→COP al contabilizar). NC restan.
@@ -325,7 +325,8 @@ mrr_report, err_mrr_report = load_sale_order_log_report(d1, d2, team_ids)
 sub_plans = load_subscription_plans()
 projects, err_proj = load_projects(d1, d2)
 
-# Staff: KPI = recurrencia; gráfico cierre = sale.order.log.report (New × plan).
+# Staff: KPI y gráfico de cierre = mismo criterio (expected_revenue · create_date).
+# La serie de recurrencia (plazas × meses) se conserva solo como referencia.
 staff_recurrente_mes = staff_recurrente_monthly(
     staff_req, subs_df, months_year, team_id=staff_team_id
 )
@@ -334,20 +335,15 @@ staff_cierre_mes = staff_cierre_monthly(
     logs=mrr_report if mrr_report is not None and not mrr_report.empty else sub_logs,
     plans=sub_plans,
 )
-staff_vendido_anual = (
-    float(staff_recurrente_mes["vendido"].sum()) if not staff_recurrente_mes.empty else 0.0
-)
 staff_cierre_anual = (
     float(staff_cierre_mes["vendido"].sum()) if not staff_cierre_mes.empty else 0.0
-)
-staff_vendido_fuente = (
-    str(staff_recurrente_mes["fuente"].iloc[0])
-    if not staff_recurrente_mes.empty else "recurrencia"
 )
 staff_cierre_fuente = (
     str(staff_cierre_mes["fuente"].iloc[0]) if not staff_cierre_mes.empty else "cierre"
 )
-# Alias usados por gráficos de cierre mes a mes
+# KPI «Vendido» Staff = mismo total que el cierre (oportunidad).
+staff_vendido_anual = staff_cierre_anual
+staff_vendido_fuente = staff_cierre_fuente
 staff_vendido_mes = staff_cierre_mes
 
 st.title("📋 Dashboard Staff, Formación y Fábrica de Software")
@@ -372,7 +368,6 @@ def kpis_linea(linea: str) -> dict:
     scol = sales_amount_col(sales)
     if linea == "Staff":
         vendido = staff_vendido_anual
-        # El gráfico de "cierre mes a mes" usa el cierre; el KPI del período usa recurrencia.
         sales_for_chart = staff_cierre_mes.rename(columns={"vendido": STAFF_VENDIDO_COL})
     else:
         vendido = float(sales[scol].sum()) if not sales.empty and scol in sales else 0.0
@@ -563,12 +558,10 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     if linea == "Staff":
         st.caption(
             f"Todos los pesos son **antes de impuestos**. "
-            f"**Vendido Staff (KPI de arriba)** = valor mensual de la plaza × meses vigentes "
-            f"(equivalente a suscripción × plan mensual; fuente: `{staff_vendido_fuente}`). "
-            f"Hoy: {fmt_money(staff_vendido_anual)}. "
-            f"**Cierre del período** (mes de `create_date`: ingreso esperado de la oportunidad): "
-            f"{fmt_money(staff_cierre_anual)} (`{staff_cierre_fuente}`). "
-            f"Ej.: 8M × 3 meses = 24M; si dura 1 mes = solo ese valor. "
+            f"**Vendido Staff** = ingreso esperado de la oportunidad (`expected_revenue`) "
+            f"en el mes de `create_date` de la OV (fuente: `{staff_vendido_fuente}`). "
+            f"Total período: {fmt_money(staff_vendido_anual)}. "
+            f"Si falta oportunidad/ingreso → fallback MRR×ciclos+(MRR/30)×días. "
             f"**Facturado** = líneas de asiento `display_type=product` (−`balance` COP)."
         )
     else:
@@ -585,7 +578,7 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     chart_fact_y_leads(linea, k["invoices"], k["leads"])
     chart_leads_origen(linea, k["leads"])
     if linea == "Staff":
-        with st.expander("Detalle total con recurrencia (valor suscripción × plan)"):
+        with st.expander("Referencia: total con recurrencia (plazas × meses, no es el KPI)"):
             st.dataframe(
                 staff_recurrente_mes,
                 use_container_width=True, hide_index=True,
@@ -596,8 +589,9 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                 },
             )
             st.caption(
-                f"Suma anual (KPI de arriba): {fmt_money(staff_vendido_anual)}. "
-                "Con plan mensual: cada mes vigente suma el Recurrente de la suscripción."
+                f"Serie histórica de recurrencia (no alimenta el KPI ni el gráfico de cierre). "
+                f"Suma: {fmt_money(float(staff_recurrente_mes['vendido'].sum()) if not staff_recurrente_mes.empty else 0)}. "
+                f"El **Vendido** del período usa la oportunidad: {fmt_money(staff_vendido_anual)}."
             )
         with st.expander("Detalle cierre Staff (valor oportunidad · create_date)"):
             st.dataframe(
@@ -761,10 +755,9 @@ with tab_resumen:
     )
     st.caption(
         f"Montos **antes de impuestos**. Para cuadrar en Odoo · "
-        f"**Vendido Staff (KPI):** valor suscripción × plan recurrente "
-        f"(Recurrente × meses vigentes; `{staff_vendido_fuente}`). "
-        f"**Cierre Staff (contratos nuevos):** {fmt_money(staff_cierre_anual)} = "
-        f"`expected_revenue` de la oportunidad (mes de create_date; fallback MRR si falta). "
+        f"**Vendido Staff (KPI):** `expected_revenue` de la oportunidad "
+        f"(mes `create_date`; `{staff_vendido_fuente}`). "
+        f"**Cierre Staff (misma base):** {fmt_money(staff_cierre_anual)}. "
         f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {periodo_label} · "
         f"Confirmado · Importe sin impuestos. "
         f"**Facturado:** `account.move.line` publicadas · tipo **product** · "
@@ -899,10 +892,10 @@ with tab_resumen:
                          labels={FACT_COL: "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
     with col_b:
-        # Staff KPI = recurrencia; Formación/Fábrica = OV.
+        # Staff KPI = oportunidad; Formación/Fábrica = OV.
         partes = []
-        if not staff_recurrente_mes.empty:
-            staff_part = staff_recurrente_mes[["mes", "vendido"]].copy()
+        if not staff_cierre_mes.empty:
+            staff_part = staff_cierre_mes[["mes", "vendido"]].copy()
             staff_part["linea"] = "Staff"
             partes.append(staff_part.rename(columns={"vendido": "monto"}))
         scol = sales_amount_col(sales_all)
@@ -914,7 +907,7 @@ with tab_resumen:
         if partes:
             mensual_v = pd.concat(partes, ignore_index=True)
             fig = px.bar(mensual_v, x="mes", y="monto", color="linea", barmode="group",
-                         title="Vendido s/imp. mes a mes por línea (Staff = recurrencia)",
+                         title="Vendido s/imp. mes a mes por línea (Staff = oportunidad)",
                          labels={"monto": "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
@@ -1286,8 +1279,9 @@ with tab_vendedor:
 
     st.markdown("#### 📦 Órdenes confirmadas por vendedor, mes y línea (s/imp.)")
     st.caption(
-        "Para Staff, el cumplimiento de meta usa el **MRR (Recurrente)** de suscripciones "
-        "cerradas por **Fecha del primer contrato**, no el amount_untaxed de la OV ni las plazas vigentes."
+        "Para Staff, el cumplimiento de meta usa el **ingreso esperado de la oportunidad** "
+        "(`expected_revenue`) en el mes de **create_date** de la OV, no el amount_untaxed "
+        "ni las plazas vigentes."
     )
     scol = sales_amount_col(sales_vend)
     if sales_vend.empty or scol not in sales_vend.columns:
@@ -1307,8 +1301,8 @@ with st.sidebar.expander("Fuentes Odoo y pendientes"):
         """
 - **Plazas** → `firefly.staffing.request` (fallback: suscripciones)
 - **Renovaciones** → `firefly.staffing.history` (fallback: `sale.order.log`)
-- **Vendido Staff (KPI)** → valor suscripción × plan recurrente (Recurrente × meses vigentes)
-- **Cierre Staff (gráfico)** → MRR nuevo por Fecha del primer contrato
+- **Vendido Staff (KPI)** → `crm.lead.expected_revenue` (mes `create_date` de la OV)
+- **Cierre Staff (gráfico)** → misma base que el KPI (oportunidad · create_date)
 - **Vendido Formación/Fábrica** → OV confirmadas por `date_order`, s/imp. en COP
 - **Facturado** → `account.move.line` tipo product, −`balance` (COP compañía)
 - **Leads / origen** → `crm.lead` + `source_id` (equipo CRM)
