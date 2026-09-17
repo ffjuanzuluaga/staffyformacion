@@ -40,7 +40,6 @@ from odoo_io import (
     load_team_activities,
     load_teams,
     load_won,
-    load_won_by_create,
     month_list,
     resolve_linea_teams,
     staff_recurrente_monthly,
@@ -326,17 +325,15 @@ mrr_report, err_mrr_report = load_sale_order_log_report(d1, d2, team_ids)
 sub_plans = load_subscription_plans()
 projects, err_proj = load_projects(d1, d2)
 
-# Staff: KPI y gráfico = oportunidades ganadas por create_date (como CRM).
-staff_team_ids = [staff_team_id] if staff_team_id else []
-won_staff = load_won_by_create(d1, d2, staff_team_ids)
+# Staff: KPI y gráfico = mismas ganadas que won_all (create_date CRM).
+# No se mezcla MRR/OV en la serie de vendido.
+won_staff = filtro_linea(won_all, "Staff") if not won_all.empty else won_all
 staff_recurrente_mes = staff_recurrente_monthly(
     staff_req, subs_df, months_year, team_id=staff_team_id
 )
 staff_cierre_mes = staff_cierre_monthly(
     staff_req, subs_df, months_year, team_id=staff_team_id,
-    logs=mrr_report if mrr_report is not None and not mrr_report.empty else sub_logs,
-    plans=sub_plans,
-    won_opps=won_staff,
+    won_opps=won_staff if won_staff is not None else pd.DataFrame(),
 )
 staff_cierre_anual = (
     float(staff_cierre_mes["vendido"].sum()) if not staff_cierre_mes.empty else 0.0
@@ -510,9 +507,10 @@ def chart_vendidos_y_proyeccion(linea: str, label: str, col_name: str):
     """Histórico = oportunidades ganadas. Proyección = pipeline con date_deadline (CRM)."""
     st.markdown(f"#### 📈 {label} vendidos (últimos 12 meses) y proyección (próximos 6)")
     st.caption(
-        "Histórico = oportunidades GANADAS (`crm.lead.won_status`). "
-        "Proyección = oportunidades ABIERTAS con fecha de cierre esperada (`date_deadline`) "
-        "en los próximos 6 meses — no es un promedio móvil."
+        "Histórico = oportunidades **GANADAS** (`won_status=won`), mes = **`create_date`** "
+        "(mismo criterio que CRM → Fecha de creación). "
+        "Proyección = oportunidades ABIERTAS con `date_deadline` en los próximos 6 meses "
+        "(no es un promedio móvil)."
     )
     hist = filtro_linea(won_12m, linea)
     if hist.empty:
@@ -735,9 +733,9 @@ with tab_resumen:
     )
     st.caption(
         f"Montos **antes de impuestos**. Para cuadrar en Odoo · "
-        f"**Vendido Staff (KPI):** opp ganadas · `expected_revenue` · "
-        f"**create_date de la oportunidad** (`{staff_vendido_fuente}`). "
-        f"**Cierre Staff (misma base):** {fmt_money(staff_cierre_anual)}. "
+        f"**Vendido Staff (KPI = Cierre):** opp **ganadas** · `expected_revenue` · "
+        f"**create_date oportunidad** (`{staff_vendido_fuente}`). "
+        f"Total: {fmt_money(staff_cierre_anual)}. "
         f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {periodo_label} · "
         f"Confirmado · Importe sin impuestos. "
         f"**Facturado:** `account.move.line` publicadas · tipo **product** · "
@@ -887,7 +885,7 @@ with tab_resumen:
         if partes:
             mensual_v = pd.concat(partes, ignore_index=True)
             fig = px.bar(mensual_v, x="mes", y="monto", color="linea", barmode="group",
-                         title="Vendido s/imp. mes a mes por línea (Staff = oportunidad)",
+                         title="Vendido s/imp. mes a mes (Staff = opp ganadas · create_date)",
                          labels={"monto": "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
@@ -1230,17 +1228,34 @@ with tab_vendedor:
     fact_vend = invoices_all[invoices_all["linea"] != "Sin línea"] if not invoices_all.empty else invoices_all
     sales_vend = sales_all[sales_all["linea"] != "Sin línea"] if not sales_all.empty else sales_all
 
-    st.markdown("#### 🏆 Cierres (nuevos negocios) por vendedor, mes y línea")
+    st.markdown("#### 🏆 Cierres (ganadas) por vendedor, mes y línea")
+    st.caption(
+        "Mes = **create_date** de la oportunidad · solo **ganadas** · "
+        "misma regla que Vendido Staff / CRM Fecha de creación."
+    )
     if won_vend.empty:
         st.info("No hay oportunidades ganadas en el período.")
     else:
-        cierres = won_vend.groupby(["mes", "vendedor", "linea"], as_index=False).agg(cierres=("name", "count"))
+        cierres = won_vend.groupby(["mes", "vendedor", "linea"], as_index=False).agg(
+            cierres=("name", "count"),
+            vendido=("expected_revenue", "sum"),
+        )
         fig = px.bar(cierres, x="mes", y="cierres", color="vendedor", barmode="group", facet_col="linea",
-                     title="Cierres por vendedor, mes y línea",
+                     title="Nº de ganadas por vendedor (mes create_date)",
                      labels={"cierres": "Cierres", "mes": "Mes"})
         st.plotly_chart(fig, use_container_width=True)
+        fig2 = px.bar(cierres, x="mes", y="vendido", color="vendedor", barmode="group", facet_col="linea",
+                      title="Ingreso esperado (expected_revenue) por vendedor",
+                      labels={"vendido": "COP", "mes": "Mes"})
+        st.plotly_chart(fig2, use_container_width=True)
         with st.expander("Detalle de cierres"):
-            st.dataframe(cierres.sort_values(["linea", "mes"]), use_container_width=True, hide_index=True)
+            st.dataframe(
+                cierres.sort_values(["linea", "mes"]),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "vendido": st.column_config.NumberColumn("Ingreso esperado", format="$%,.0f"),
+                },
+            )
 
     st.markdown("#### 🧾 Facturación s/imp. por vendedor, mes y línea")
     if fact_vend.empty or FACT_COL not in fact_vend.columns:
@@ -1257,21 +1272,26 @@ with tab_vendedor:
                 column_config={FACT_COL: st.column_config.NumberColumn("Facturado s/imp.", format="$%,.0f")},
             )
 
-    st.markdown("#### 📦 Órdenes confirmadas por vendedor, mes y línea (s/imp.)")
+    st.markdown("#### 📦 Órdenes confirmadas — Formación / Fábrica (referencia OV)")
     st.caption(
-        "Para Staff, el cumplimiento de meta usa oportunidades **ganadas** "
-        "(`expected_revenue`) por **fecha de creación de la oportunidad** (como CRM), "
-        "no la fecha de la OV ni plazas vigentes."
+        "**Staff no usa OV aquí**: el vendido Staff es solo oportunidades ganadas "
+        "(`expected_revenue` · create_date). Esta sección es `date_order` + s/imp. "
+        "de OV para Formación y Fábrica."
     )
     scol = sales_amount_col(sales_vend)
-    if sales_vend.empty or scol not in sales_vend.columns:
-        st.info("No hay órdenes confirmadas en el período.")
+    otras_ov = (
+        sales_vend[sales_vend["linea"].isin(["Formación", "Fábrica de Software"])]
+        if not sales_vend.empty and "linea" in sales_vend.columns
+        else sales_vend
+    )
+    if otras_ov.empty or scol not in otras_ov.columns:
+        st.info("No hay órdenes confirmadas de Formación/Fábrica en el período.")
     else:
-        ov = sales_vend.groupby(["mes", "vendedor", "linea"], as_index=False).agg(
+        ov = otras_ov.groupby(["mes", "vendedor", "linea"], as_index=False).agg(
             ordenes=("name", "count"), vendido=(scol, "sum")
         )
         fig = px.bar(ov, x="mes", y="ordenes", color="vendedor", barmode="group", facet_col="linea",
-                     title="Nº de OV confirmadas por vendedor",
+                     title="Nº de OV confirmadas (Formación / Fábrica)",
                      labels={"ordenes": "Órdenes", "mes": "Mes"})
         st.plotly_chart(fig, use_container_width=True)
 
@@ -1281,10 +1301,11 @@ with st.sidebar.expander("Fuentes Odoo y pendientes"):
         """
 - **Plazas** → `firefly.staffing.request` (fallback: suscripciones)
 - **Renovaciones** → `firefly.staffing.history` (fallback: `sale.order.log`)
-- **Vendido Staff (KPI)** → opp ganadas · `expected_revenue` · create_date oportunidad
-- **Cierre Staff (gráfico)** → misma base (como CRM Fecha de creación)
-- **Vendido Formación/Fábrica** → OV confirmadas por `date_order`, s/imp. en COP
-- **Facturado** → `account.move.line` tipo product, −`balance` (COP compañía)
+- **Vendido / Cierre Staff** → opp **ganadas** · `expected_revenue` · **create_date** oportunidad (CRM)
+- **Cierres CRM (todas las líneas)** → misma fecha: create_date · won
+- **Vendido Formación/Fábrica** → OV confirmadas · `date_order` · s/imp. COP
+- **Neto YTD Staff** → plazas vigentes (ingreso − proveedor − fijo); *no* es el vendido CRM
+- **Facturado** → `account.move.line` product · −balance COP
 - **Leads / origen** → `crm.lead` + `source_id` (equipo CRM)
 - **Cursos/proyectos entregados** → `project.project.service_line` (fecha fin = proxy)
 - **Actividades hechas** → `crm.activity.report`

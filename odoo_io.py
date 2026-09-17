@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
-_DATA_VERSION = 30
+_DATA_VERSION = 31
 
 
 def allowed_team_ids() -> set[int]:
@@ -709,12 +709,14 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     return df
 
 
-@st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas (por create_date)...")
+@st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas...")
 def load_won_by_create(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
-    """Oportunidades ganadas agrupables como en CRM (Fecha de creación).
+    """Oportunidades ganadas · mes = create_date (como CRM → Fecha de creación).
 
-    Solo `won_status=won`. El mes = create_date de la oportunidad (no date_closed
-    ni create_date de la OV).
+    Regla única del tablero para dinero/cierres CRM:
+      - solo won_status=won
+      - valor = expected_revenue
+      - mes = create_date de la oportunidad
     """
     domain = [
         ("type", "=", "opportunity"),
@@ -755,6 +757,12 @@ def load_won_by_create(date_from: str, date_to: str, team_ids: list[int]) -> pd.
 
 @st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas...")
 def load_won(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    """Alias: ganadas por create_date (misma regla que load_won_by_create / CRM)."""
+    return load_won_by_create(date_from, date_to, team_ids)
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas (por date_closed)...")
+def load_won_by_closed(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
     domain = [
         ("type", "=", "opportunity"),
         ("won_status", "=", "won"),

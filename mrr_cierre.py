@@ -289,11 +289,13 @@ def staff_cierre_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | Non
                          logs: pd.DataFrame | None = None,
                          plans: pd.DataFrame | None = None,
                          won_opps: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Cierre = ganadas por create_date de la opp; fallback OV/staffing."""
-    if won_opps is not None and not won_opps.empty:
-        out = cierre_from_won_opps(won_opps, months, team_id=team_id)
-        if float(out["vendido"].sum()) > 0:
-            return out
+    """Cierre Staff = solo opp ganadas · create_date · expected_revenue.
+
+    Si se pasa `won_opps` (aunque vacío), no se mezcla con MRR/OV: el reporte
+    queda uniforme con CRM. Fallbacks solo si won_opps es None (legado).
+    """
+    if won_opps is not None:
+        return cierre_from_won_opps(won_opps, months, team_id=team_id)
     if subs is not None and not subs.empty:
         out = subscription_cierre_from_subs(subs, months, team_id=team_id, plans=plans)
         if float(out["vendido"].sum()) > 0:
