@@ -66,8 +66,8 @@ st.set_page_config(
 
 
 # Vendido (Formación / Fábrica) = amount_untaxed_company (COP, OV + TRM).
-# Vendido Staff (KPI período) = expected_revenue ganadas · create_date oportunidad.
-# Cierre Staff (gráfico) = misma base (como CRM Fecha de creación).
+# Vendido Staff (KPI período) = expected_revenue ganadas · date_closed (cuando se ganó).
+# Cierre Staff (gráfico) = misma base.
 # Facturado = amount_untaxed_signed → base imponible en COP compañía
 # (Odoo ya convierte USD→COP al contabilizar). NC restan.
 # amount_untaxed_in_currency_signed se muestra solo en debug (moneda documento).
@@ -325,7 +325,7 @@ mrr_report, err_mrr_report = load_sale_order_log_report(d1, d2, team_ids)
 sub_plans = load_subscription_plans()
 projects, err_proj = load_projects(d1, d2)
 
-# Staff: KPI y gráfico = mismas ganadas que won_all (create_date CRM).
+# Staff: KPI y gráfico = mismas ganadas que won_all (date_closed = cuando se ganó).
 # No se mezcla MRR/OV en la serie de vendido.
 won_staff = filtro_linea(won_all, "Staff") if not won_all.empty else won_all
 staff_recurrente_mes = staff_recurrente_monthly(
@@ -414,7 +414,7 @@ def chart_venta_vs_meta(linea: str, sales: pd.DataFrame):
     meta_m = meta_anual_de(metas_lineas, linea) / 12
     if linea == "Staff":
         scol = STAFF_VENDIDO_COL
-        titulo = f"{linea} — cierre (opp ganadas · mes create_date CRM) vs. meta ({periodo_label})"
+        titulo = f"{linea} — cierre (opp ganadas · mes date_closed) vs. meta ({periodo_label})"
         ventas_mes = (
             sales.groupby("mes", as_index=False)[scol].sum()
             if sales is not None and not sales.empty and scol in sales
@@ -507,8 +507,8 @@ def chart_vendidos_y_proyeccion(linea: str, label: str, col_name: str):
     """Histórico = oportunidades ganadas. Proyección = pipeline con date_deadline (CRM)."""
     st.markdown(f"#### 📈 {label} vendidos (últimos 12 meses) y proyección (próximos 6)")
     st.caption(
-        "Histórico = oportunidades **GANADAS** (`won_status=won`), mes = **`create_date`** "
-        "(mismo criterio que CRM → Fecha de creación). "
+        "Histórico = oportunidades **GANADAS** (`won_status=won`), mes = **`date_closed`** "
+        "(fecha en que se marcó Ganado). "
         "Proyección = oportunidades ABIERTAS con `date_deadline` en los próximos 6 meses "
         "(no es un promedio móvil)."
     )
@@ -560,7 +560,7 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
         st.caption(
             f"Todos los pesos son **antes de impuestos**. "
             f"**Vendido Staff** = `expected_revenue` de oportunidades **ganadas** "
-            f"por **fecha de creación de la oportunidad** (mismo criterio que CRM). "
+            f"por **fecha en que se marcó Ganado** (`date_closed`). "
             f"Fuente: `{staff_vendido_fuente}`. Total período: {fmt_money(staff_vendido_anual)}. "
             f"Perdidas/abiertas no cuentan. "
             f"**Facturado** = líneas de asiento `display_type=product` (−`balance` COP)."
@@ -594,7 +594,7 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                 f"Suma: {fmt_money(float(staff_recurrente_mes['vendido'].sum()) if not staff_recurrente_mes.empty else 0)}. "
                 f"El **Vendido** del período usa la oportunidad: {fmt_money(staff_vendido_anual)}."
             )
-        with st.expander("Detalle cierre Staff (opp ganadas · create_date CRM)"):
+        with st.expander("Detalle cierre Staff (opp ganadas · date_closed)"):
             st.dataframe(
                 staff_cierre_mes,
                 use_container_width=True, hide_index=True,
@@ -616,12 +616,11 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                     "expected_revenue", "valor_vendido", "vendedor", "equipo", "opp_won_status",
                 ] if c in det.columns]
                 st.caption(
-                    "Mes = **`create_date` de la oportunidad** (como CRM → Fecha de creación). "
-                    "Solo **ganadas**. Ej. febrero = 67.5M + 103.9M = 171.4M. "
+                    "Mes = **`date_closed`** (cuando se marcó **Ganado**). Solo ganadas. "
                     f"Suma del período: {fmt_money(staff_cierre_anual)}."
                 )
                 st.dataframe(
-                    det[cols].sort_values("create_date"),
+                    det[cols].sort_values("date_closed"),
                     use_container_width=True, hide_index=True,
                     column_config={
                         "expected_revenue": st.column_config.NumberColumn("Ingreso esperado", format="%,.0f"),
@@ -734,7 +733,7 @@ with tab_resumen:
     st.caption(
         f"Montos **antes de impuestos**. Para cuadrar en Odoo · "
         f"**Vendido Staff (KPI = Cierre):** opp **ganadas** · `expected_revenue` · "
-        f"**create_date oportunidad** (`{staff_vendido_fuente}`). "
+        f"**date_closed** (`{staff_vendido_fuente}`). "
         f"Total: {fmt_money(staff_cierre_anual)}. "
         f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {periodo_label} · "
         f"Confirmado · Importe sin impuestos. "
@@ -885,7 +884,7 @@ with tab_resumen:
         if partes:
             mensual_v = pd.concat(partes, ignore_index=True)
             fig = px.bar(mensual_v, x="mes", y="monto", color="linea", barmode="group",
-                         title="Vendido s/imp. mes a mes (Staff = opp ganadas · create_date)",
+                         title="Vendido s/imp. mes a mes (Staff = opp ganadas · date_closed)",
                          labels={"monto": "COP s/imp.", "mes": "Mes"})
             st.plotly_chart(fig, use_container_width=True)
 
@@ -1230,8 +1229,8 @@ with tab_vendedor:
 
     st.markdown("#### 🏆 Cierres (ganadas) por vendedor, mes y línea")
     st.caption(
-        "Mes = **create_date** de la oportunidad · solo **ganadas** · "
-        "misma regla que Vendido Staff / CRM Fecha de creación."
+        "Mes = **date_closed** (cuando se ganó) · solo **ganadas** · "
+        "misma regla que Vendido Staff."
     )
     if won_vend.empty:
         st.info("No hay oportunidades ganadas en el período.")
@@ -1241,7 +1240,7 @@ with tab_vendedor:
             vendido=("expected_revenue", "sum"),
         )
         fig = px.bar(cierres, x="mes", y="cierres", color="vendedor", barmode="group", facet_col="linea",
-                     title="Nº de ganadas por vendedor (mes create_date)",
+                     title="Nº de ganadas por vendedor (mes date_closed)",
                      labels={"cierres": "Cierres", "mes": "Mes"})
         st.plotly_chart(fig, use_container_width=True)
         fig2 = px.bar(cierres, x="mes", y="vendido", color="vendedor", barmode="group", facet_col="linea",
@@ -1301,8 +1300,8 @@ with st.sidebar.expander("Fuentes Odoo y pendientes"):
         """
 - **Plazas** → `firefly.staffing.request` (fallback: suscripciones)
 - **Renovaciones** → `firefly.staffing.history` (fallback: `sale.order.log`)
-- **Vendido / Cierre Staff** → opp **ganadas** · `expected_revenue` · **create_date** oportunidad (CRM)
-- **Cierres CRM (todas las líneas)** → misma fecha: create_date · won
+- **Vendido / Cierre Staff** → opp **ganadas** · `expected_revenue` · **date_closed** (cuando se ganó)
+- **Cierres CRM (todas las líneas)** → misma fecha: date_closed · won
 - **Vendido Formación/Fábrica** → OV confirmadas · `date_order` · s/imp. COP
 - **Neto YTD Staff** → plazas vigentes (ingreso − proveedor − fijo); *no* es el vendido CRM
 - **Facturado** → `account.move.line` product · −balance COP

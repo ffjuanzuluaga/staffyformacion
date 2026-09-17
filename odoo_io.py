@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
-_DATA_VERSION = 31
+_DATA_VERSION = 32
 
 
 def allowed_team_ids() -> set[int]:
@@ -709,15 +709,61 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     return df
 
 
-@st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas...")
-def load_won_by_create(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
-    """Oportunidades ganadas · mes = create_date (como CRM → Fecha de creación).
+@st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas (por date_closed)...")
+def load_won_by_closed(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    """Oportunidades ganadas · mes = date_closed (fecha en que se marcó Ganado).
 
     Regla única del tablero para dinero/cierres CRM:
       - solo won_status=won
       - valor = expected_revenue
-      - mes = create_date de la oportunidad
+      - mes = date_closed (cuando se ganó)
     """
+    domain = [
+        ("type", "=", "opportunity"),
+        ("won_status", "=", "won"),
+        ("date_closed", ">=", date_from),
+        ("date_closed", "<=", f"{date_to} 23:59:59"),
+        "|", ("active", "=", True), ("active", "=", False),
+    ]
+    if team_ids:
+        domain.append(("team_id", "in", team_ids))
+    fields = pick_fields(
+        "crm.lead",
+        ["name", "create_date", "date_closed", "user_id", "team_id", "partner_id",
+         "expected_revenue", "source_id", "won_status"],
+    )
+    try:
+        df = search_read("crm.lead", domain, fields, order="date_closed")
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["date_closed"] = pd.to_datetime(df.get("date_closed"), errors="coerce")
+    df["create_date"] = pd.to_datetime(df.get("create_date"), errors="coerce")
+    df = df[df["date_closed"].notna()].copy()
+    if df.empty:
+        return df
+    df["mes"] = df["date_closed"].dt.to_period("M").astype(str)
+    df["vendedor"] = m2o_name(df["user_id"]) if "user_id" in df else "Sin asignar"
+    df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
+    df["equipo_id"] = m2o_id(df["team_id"]) if "team_id" in df else None
+    df["cliente"] = m2o_name(df["partner_id"]) if "partner_id" in df else "Sin asignar"
+    df["origen"] = m2o_name(df["source_id"]) if "source_id" in df else "Sin asignar"
+    df["linea"] = classify_linea(df)
+    df["expected_revenue"] = pd.to_numeric(df.get("expected_revenue", 0), errors="coerce").fillna(0.0)
+    df["opp_won_status"] = "won"
+    return df
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas...")
+def load_won(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    """Alias: ganadas por date_closed (fecha en que se marcó Ganado)."""
+    return load_won_by_closed(date_from, date_to, team_ids)
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas (por create_date)...")
+def load_won_by_create(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    """Oportunidades ganadas · mes = create_date (referencia / legacy)."""
     domain = [
         ("type", "=", "opportunity"),
         ("won_status", "=", "won"),
@@ -752,39 +798,6 @@ def load_won_by_create(date_from: str, date_to: str, team_ids: list[int]) -> pd.
     df["linea"] = classify_linea(df)
     df["expected_revenue"] = pd.to_numeric(df.get("expected_revenue", 0), errors="coerce").fillna(0.0)
     df["opp_won_status"] = "won"
-    return df
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas...")
-def load_won(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
-    """Alias: ganadas por create_date (misma regla que load_won_by_create / CRM)."""
-    return load_won_by_create(date_from, date_to, team_ids)
-
-
-@st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas (por date_closed)...")
-def load_won_by_closed(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
-    domain = [
-        ("type", "=", "opportunity"),
-        ("won_status", "=", "won"),
-        ("date_closed", ">=", date_from),
-        ("date_closed", "<=", f"{date_to} 23:59:59"),
-    ]
-    if team_ids:
-        domain.append(("team_id", "in", team_ids))
-    fields = pick_fields(
-        "crm.lead",
-        ["name", "date_closed", "user_id", "team_id", "partner_id", "expected_revenue", "source_id"],
-    )
-    df = search_read("crm.lead", domain, fields, order="date_closed")
-    if df.empty:
-        return df
-    df["date_closed"] = pd.to_datetime(df["date_closed"])
-    df["mes"] = df["date_closed"].dt.to_period("M").astype(str)
-    df["vendedor"] = m2o_name(df["user_id"])
-    df["equipo"] = m2o_name(df["team_id"])
-    df["cliente"] = m2o_name(df["partner_id"])
-    df["origen"] = m2o_name(df["source_id"]) if "source_id" in df else "Sin asignar"
-    df["linea"] = classify_linea(df)
     return df
 
 

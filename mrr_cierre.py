@@ -3,14 +3,13 @@
 
 Regla de negocio:
   Valor = `expected_revenue` de oportunidades CRM **ganadas** (`won_status=won`).
-  Mes del gráfico = **create_date de la oportunidad** (igual que CRM → Fecha de creación).
+  Mes del gráfico = **date_closed** (fecha en que se marcó Ganado).
 
   No entran perdidas ni abiertas.
-  No se usa create_date de la OV (eso desalinea febrero CRM 171M vs dashboard).
+  No se usa create_date de la OV ni create_date de la oportunidad.
 
-  Fallback si no hay ganadas en el período:
-    MRR × ciclos + (MRR/30)×días por OV (mes create_date de la OV),
-    o staffing.request.
+  Fallback si won_opps es None (legado):
+    MRR × ciclos + (MRR/30)×días por OV, o staffing.request.
 """
 
 from __future__ import annotations
@@ -177,8 +176,8 @@ def plan_period_months(value, unit) -> float:
 
 def cierre_from_won_opps(won_opps: pd.DataFrame, months: list[str],
                          team_id: int | None = None) -> pd.DataFrame:
-    """Σ expected_revenue de ganadas por mes de create_date de la oportunidad."""
-    fuente = "crm.lead ganadas · expected_revenue · mes create_date (CRM)"
+    """Σ expected_revenue de ganadas por mes de date_closed (cuando se ganó)."""
+    fuente = "crm.lead ganadas · expected_revenue · mes date_closed (ganada)"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -192,12 +191,17 @@ def cierre_from_won_opps(won_opps: pd.DataFrame, months: list[str],
     elif team_id is not None and "linea" in df.columns:
         df = df[df["linea"] == "Staff"]
 
-    if "mes" not in df.columns:
-        if "create_date" not in df.columns:
+    if "mes" not in df.columns or df["mes"].isna().all():
+        if "date_closed" in df.columns and df["date_closed"].notna().any():
+            df["date_closed"] = pd.to_datetime(df["date_closed"], errors="coerce")
+            df = df[df["date_closed"].notna()].copy()
+            df["mes"] = df["date_closed"].dt.to_period("M").astype(str)
+        elif "create_date" in df.columns:
+            df["create_date"] = pd.to_datetime(df["create_date"], errors="coerce")
+            df = df[df["create_date"].notna()].copy()
+            df["mes"] = df["create_date"].dt.to_period("M").astype(str)
+        else:
             return empty
-        df["create_date"] = pd.to_datetime(df["create_date"], errors="coerce")
-        df = df[df["create_date"].notna()].copy()
-        df["mes"] = df["create_date"].dt.to_period("M").astype(str)
 
     df = df[df["mes"].isin(months)].copy()
     if df.empty:
@@ -289,10 +293,10 @@ def staff_cierre_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | Non
                          logs: pd.DataFrame | None = None,
                          plans: pd.DataFrame | None = None,
                          won_opps: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Cierre Staff = solo opp ganadas · create_date · expected_revenue.
+    """Cierre Staff = solo opp ganadas · date_closed · expected_revenue.
 
     Si se pasa `won_opps` (aunque vacío), no se mezcla con MRR/OV: el reporte
-    queda uniforme con CRM. Fallbacks solo si won_opps es None (legado).
+    queda uniforme con la fecha en que se marcó Ganado.
     """
     if won_opps is not None:
         return cierre_from_won_opps(won_opps, months, team_id=team_id)
