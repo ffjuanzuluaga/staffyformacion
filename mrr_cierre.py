@@ -2,14 +2,15 @@
 """Cierre Staff — valor vendido en el mes de create_date de la OV.
 
 Regla de negocio:
-  Valor = `expected_revenue` de la oportunidad CRM (`sale.order.opportunity_id`).
+  Valor = `expected_revenue` de la oportunidad CRM **ganada**
+  (`sale.order.opportunity_id` con `won_status=won`).
   Mes del gráfico = create_date de la OV.
 
-  Fallback si no hay oportunidad / expected_revenue=0:
+  No entran oportunidades perdidas ni abiertas.
+
+  Fallback si no hay oportunidad ganada / expected_revenue=0:
     MRR × ciclos mensuales + (MRR/30) × días (aniversarios start→end),
     o amount_untaxed si no hay MRR.
-
-  Ej. oportunidad «4 meses × 10M» con expected_revenue=40M → 40M en create_date.
 """
 
 from __future__ import annotations
@@ -188,7 +189,7 @@ def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
     """Suma en el mes de create_date: expected_revenue de la oportunidad."""
     from odoo_io import _subscription_cierre_frame
 
-    fuente = "crm.lead.expected_revenue (oportunidad · mes create_date)"
+    fuente = "crm.lead.expected_revenue (solo ganadas · mes create_date)"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -233,7 +234,7 @@ def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
     if used_opp == 0:
         fuente = "fallback MRR×ciclos+(MRR/30)×días (sin expected_revenue)"
     elif used_opp < len(sub):
-        fuente = "crm.lead.expected_revenue (+ fallback MRR si falta opp)"
+        fuente = "crm.lead.expected_revenue ganadas (+ fallback MRR si falta opp)"
 
     por_mes = (
         sub.groupby("mes", as_index=False)["valor_vendido"]
@@ -260,7 +261,7 @@ def staff_cierre_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | Non
                          months: list[str], team_id: int | None = None,
                          logs: pd.DataFrame | None = None,
                          plans: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Cierre comercial = expected_revenue de la oportunidad (mes create_date)."""
+    """Cierre comercial = expected_revenue de oportunidades ganadas (mes create_date)."""
     if subs is not None and not subs.empty:
         out = subscription_cierre_from_subs(subs, months, team_id=team_id, plans=plans)
         if float(out["vendido"].sum()) > 0:

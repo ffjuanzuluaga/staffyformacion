@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
-_DATA_VERSION = 28
+_DATA_VERSION = 29
 
 
 def allowed_team_ids() -> set[int]:
@@ -1129,9 +1129,10 @@ def load_subscriptions(team_id: int | None):
     else:
         df["recurring_monthly_company"] = mrr
 
-    # Valor de la oportunidad CRM (cierre Staff preferido sobre MRR × meses).
+    # Valor de la oportunidad CRM: solo GANADAS (won_status=won).
     df["oportunidad"] = ""
     df["expected_revenue"] = 0.0
+    df["opp_won_status"] = ""
     df["opp_id"] = pd.Series([pd.NA] * len(df), dtype="Int64")
     if "opportunity_id" in df.columns:
         df["opp_id"] = m2o_id(df["opportunity_id"]).astype("Int64")
@@ -1142,18 +1143,22 @@ def load_subscriptions(team_id: int | None):
                 opps = search_read(
                     "crm.lead",
                     [("id", "in", opp_ids)],
-                    pick_fields("crm.lead", ["name", "expected_revenue"]),
+                    pick_fields("crm.lead", ["name", "expected_revenue", "won_status"]),
                 )
             except Exception:
                 opps = pd.DataFrame()
             if not opps.empty and "id" in opps.columns:
                 opps = opps.copy()
                 opps["id"] = pd.to_numeric(opps["id"], errors="coerce").astype("Int64")
+                status = opps.get("won_status", pd.Series("", index=opps.index)).fillna("").astype(str)
                 rev = pd.to_numeric(opps.get("expected_revenue", 0), errors="coerce").fillna(0.0)
+                # Solo ingreso esperado de oportunidades ganadas.
+                rev = rev.where(status == "won", 0.0)
                 rev_map = dict(zip(opps["id"], rev))
+                status_map = dict(zip(opps["id"], status))
                 name_map = dict(zip(opps["id"], opps.get("name", pd.Series(dtype=str)).fillna("")))
                 df["expected_revenue"] = df["opp_id"].map(rev_map).fillna(0.0)
-                # Preferir nombre leído del lead si el m2o vino vacío.
+                df["opp_won_status"] = df["opp_id"].map(status_map).fillna("")
                 from_lead = df["opp_id"].map(name_map).fillna("")
                 miss_name = df["oportunidad"].astype(str).str.strip().isin(["", "False", "None"])
                 df.loc[miss_name, "oportunidad"] = from_lead.loc[miss_name]

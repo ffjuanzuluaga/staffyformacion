@@ -558,10 +558,11 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     if linea == "Staff":
         st.caption(
             f"Todos los pesos son **antes de impuestos**. "
-            f"**Vendido Staff** = ingreso esperado de la oportunidad (`expected_revenue`) "
-            f"en el mes de `create_date` de la OV (fuente: `{staff_vendido_fuente}`). "
+            f"**Vendido Staff** = ingreso esperado de oportunidades **ganadas** "
+            f"(`expected_revenue`, `won_status=won`) en el mes de `create_date` "
+            f"(fuente: `{staff_vendido_fuente}`). "
             f"Total período: {fmt_money(staff_vendido_anual)}. "
-            f"Si falta oportunidad/ingreso → fallback MRR×ciclos+(MRR/30)×días. "
+            f"Perdidas/abiertas no cuentan. Sin opp ganada → fallback MRR. "
             f"**Facturado** = líneas de asiento `display_type=product` (−`balance` COP)."
         )
     else:
@@ -629,14 +630,15 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                     for m, s, e, u, o in zip(mrr, start_s, end_s, untaxed, opp)
                 ]
                 cols = [c for c in [
-                    "name", "cliente", "oportunidad", "expected_revenue", "create_date", "mes",
+                    "name", "cliente", "oportunidad", "opp_won_status", "expected_revenue",
+                    "create_date", "mes",
                     "start_date", "end_date", "meses_contrato", "dias_contrato",
                     "recurring_monthly", "amount_untaxed", "valor_vendido", "plan", "equipo", "subscription_state",
                 ] if c in det.columns]
                 st.caption(
-                    "En el mes de **`create_date`**: valor = **`expected_revenue`** de la oportunidad "
-                    "(`crm.lead`). Si no hay oportunidad/ingresos esperados, fallback "
-                    "MRR×ciclos+(MRR/30)×días o `amount_untaxed`. "
+                    "En el mes de **`create_date`**: valor = **`expected_revenue`** solo si la "
+                    "oportunidad está **ganada** (`won_status=won`). Perdidas/abiertas = 0 "
+                    "(fallback MRR×ciclos o `amount_untaxed`). "
                     f"Suma del período: {fmt_money(staff_cierre_anual)}."
                 )
                 st.dataframe(
