@@ -1274,7 +1274,7 @@ with tab_vendedor:
     st.markdown("#### 📦 Órdenes confirmadas — Formación / Fábrica (referencia OV)")
     st.caption(
         "**Staff no usa OV aquí**: el vendido Staff es solo oportunidades ganadas "
-        "(`expected_revenue` · create_date). Esta sección es `date_order` + s/imp. "
+        "(`expected_revenue` · date_closed). Esta sección es `date_order` + s/imp. "
         "de OV para Formación y Fábrica."
     )
     scol = sales_amount_col(sales_vend)
