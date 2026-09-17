@@ -40,6 +40,7 @@ from odoo_io import (
     load_team_activities,
     load_teams,
     load_won,
+    load_won_by_create,
     month_list,
     resolve_linea_teams,
     staff_recurrente_monthly,
@@ -66,8 +67,8 @@ st.set_page_config(
 
 
 # Vendido (Formación / Fábrica) = amount_untaxed_company (COP, OV + TRM).
-# Vendido Staff (KPI período) = expected_revenue de la oportunidad (igual que el cierre).
-# Cierre Staff (gráfico mes a mes) = expected_revenue de la oportunidad en create_date.
+# Vendido Staff (KPI período) = expected_revenue ganadas · create_date oportunidad.
+# Cierre Staff (gráfico) = misma base (como CRM Fecha de creación).
 # Facturado = amount_untaxed_signed → base imponible en COP compañía
 # (Odoo ya convierte USD→COP al contabilizar). NC restan.
 # amount_untaxed_in_currency_signed se muestra solo en debug (moneda documento).
@@ -325,8 +326,9 @@ mrr_report, err_mrr_report = load_sale_order_log_report(d1, d2, team_ids)
 sub_plans = load_subscription_plans()
 projects, err_proj = load_projects(d1, d2)
 
-# Staff: KPI y gráfico de cierre = mismo criterio (expected_revenue · create_date).
-# La serie de recurrencia (plazas × meses) se conserva solo como referencia.
+# Staff: KPI y gráfico = oportunidades ganadas por create_date (como CRM).
+staff_team_ids = [staff_team_id] if staff_team_id else []
+won_staff = load_won_by_create(d1, d2, staff_team_ids)
 staff_recurrente_mes = staff_recurrente_monthly(
     staff_req, subs_df, months_year, team_id=staff_team_id
 )
@@ -334,6 +336,7 @@ staff_cierre_mes = staff_cierre_monthly(
     staff_req, subs_df, months_year, team_id=staff_team_id,
     logs=mrr_report if mrr_report is not None and not mrr_report.empty else sub_logs,
     plans=sub_plans,
+    won_opps=won_staff,
 )
 staff_cierre_anual = (
     float(staff_cierre_mes["vendido"].sum()) if not staff_cierre_mes.empty else 0.0
@@ -414,7 +417,7 @@ def chart_venta_vs_meta(linea: str, sales: pd.DataFrame):
     meta_m = meta_anual_de(metas_lineas, linea) / 12
     if linea == "Staff":
         scol = STAFF_VENDIDO_COL
-        titulo = f"{linea} — cierre (valor oportunidad · mes create_date) vs. meta ({periodo_label})"
+        titulo = f"{linea} — cierre (opp ganadas · mes create_date CRM) vs. meta ({periodo_label})"
         ventas_mes = (
             sales.groupby("mes", as_index=False)[scol].sum()
             if sales is not None and not sales.empty and scol in sales
@@ -558,11 +561,10 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
     if linea == "Staff":
         st.caption(
             f"Todos los pesos son **antes de impuestos**. "
-            f"**Vendido Staff** = ingreso esperado de oportunidades **ganadas** "
-            f"(`expected_revenue`, `won_status=won`) en el mes de `create_date` "
-            f"(fuente: `{staff_vendido_fuente}`). "
-            f"Total período: {fmt_money(staff_vendido_anual)}. "
-            f"Perdidas/abiertas no cuentan. Sin opp ganada → fallback MRR. "
+            f"**Vendido Staff** = `expected_revenue` de oportunidades **ganadas** "
+            f"por **fecha de creación de la oportunidad** (mismo criterio que CRM). "
+            f"Fuente: `{staff_vendido_fuente}`. Total período: {fmt_money(staff_vendido_anual)}. "
+            f"Perdidas/abiertas no cuentan. "
             f"**Facturado** = líneas de asiento `display_type=product` (−`balance` COP)."
         )
     else:
@@ -594,7 +596,7 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                 f"Suma: {fmt_money(float(staff_recurrente_mes['vendido'].sum()) if not staff_recurrente_mes.empty else 0)}. "
                 f"El **Vendido** del período usa la oportunidad: {fmt_money(staff_vendido_anual)}."
             )
-        with st.expander("Detalle cierre Staff (valor oportunidad · create_date)"):
+        with st.expander("Detalle cierre Staff (opp ganadas · create_date CRM)"):
             st.dataframe(
                 staff_cierre_mes,
                 use_container_width=True, hide_index=True,
@@ -604,56 +606,32 @@ def render_linea_comun(linea: str, extra_kpi_label: str, extra_kpi_value):
                     "fuente": "Fuente",
                 },
             )
-            det = staff_cierre_detail(subs_df, team_id=staff_team_id)
+            det = won_staff
             if det is not None and not det.empty:
-                from mrr_cierre import contract_duration, valor_vendido_contrato
                 det = det.copy()
-                if "create_date" not in det.columns:
-                    det["create_date"] = pd.NaT
-                if "date_order" in det.columns:
-                    miss = det["create_date"].isna()
-                    det.loc[miss, "create_date"] = det.loc[miss, "date_order"]
-                det = det[det["create_date"].notna()]
-                det["mes"] = det["create_date"].dt.to_period("M").astype(str)
-                det = det[det["mes"].isin(months_year)]
-                start_s = det["start_date"] if "start_date" in det.columns else det["create_date"]
-                start_s = start_s.fillna(det["create_date"])
-                end_s = det["end_date"] if "end_date" in det.columns else pd.Series(pd.NaT, index=det.index)
-                mrr = pd.to_numeric(det.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
-                dur = [contract_duration(s, e) for s, e in zip(start_s, end_s)]
-                det["meses_contrato"] = [d[0] for d in dur]
-                det["dias_contrato"] = [d[1] for d in dur]
-                untaxed = pd.to_numeric(det.get("amount_untaxed", 0), errors="coerce").fillna(0.0)
-                opp = pd.to_numeric(det.get("expected_revenue", 0), errors="coerce").fillna(0.0)
-                det["valor_vendido"] = [
-                    valor_vendido_contrato(m, s, e, u, o)
-                    for m, s, e, u, o in zip(mrr, start_s, end_s, untaxed, opp)
-                ]
+                if staff_team_id is not None and "equipo_id" in det.columns:
+                    det = det[pd.to_numeric(det["equipo_id"], errors="coerce") == int(staff_team_id)]
+                det = det[det["mes"].isin(months_year)] if "mes" in det.columns else det
+                det["valor_vendido"] = pd.to_numeric(det.get("expected_revenue", 0), errors="coerce").fillna(0.0)
                 cols = [c for c in [
-                    "name", "cliente", "oportunidad", "opp_won_status", "expected_revenue",
-                    "create_date", "mes",
-                    "start_date", "end_date", "meses_contrato", "dias_contrato",
-                    "recurring_monthly", "amount_untaxed", "valor_vendido", "plan", "equipo", "subscription_state",
+                    "name", "cliente", "create_date", "date_closed", "mes",
+                    "expected_revenue", "valor_vendido", "vendedor", "equipo", "opp_won_status",
                 ] if c in det.columns]
                 st.caption(
-                    "En el mes de **`create_date`**: valor = **`expected_revenue`** solo si la "
-                    "oportunidad está **ganada** (`won_status=won`). Perdidas/abiertas = 0 "
-                    "(fallback MRR×ciclos o `amount_untaxed`). "
+                    "Mes = **`create_date` de la oportunidad** (como CRM → Fecha de creación). "
+                    "Solo **ganadas**. Ej. febrero = 67.5M + 103.9M = 171.4M. "
                     f"Suma del período: {fmt_money(staff_cierre_anual)}."
                 )
                 st.dataframe(
                     det[cols].sort_values("create_date"),
                     use_container_width=True, hide_index=True,
                     column_config={
-                        "expected_revenue": st.column_config.NumberColumn("Ingreso esperado (opp)", format="%,.0f"),
-                        "recurring_monthly": st.column_config.NumberColumn("MRR / mes", format="%,.0f"),
-                        "meses_contrato": st.column_config.NumberColumn("Meses", format="%d"),
-                        "dias_contrato": st.column_config.NumberColumn("Días", format="%d"),
+                        "expected_revenue": st.column_config.NumberColumn("Ingreso esperado", format="%,.0f"),
                         "valor_vendido": st.column_config.NumberColumn("Vendido", format="%,.0f"),
                     },
                 )
             else:
-                st.caption("Sin suscripciones Staff en el filtro de cierre.")
+                st.caption("Sin oportunidades Staff ganadas en el filtro.")
 
         with st.expander("Detalle OV Staff (referencia: amount_untaxed de 1 período)"):
             s = k.get("sales_ov")
@@ -757,8 +735,8 @@ with tab_resumen:
     )
     st.caption(
         f"Montos **antes de impuestos**. Para cuadrar en Odoo · "
-        f"**Vendido Staff (KPI):** `expected_revenue` de la oportunidad "
-        f"(mes `create_date`; `{staff_vendido_fuente}`). "
+        f"**Vendido Staff (KPI):** opp ganadas · `expected_revenue` · "
+        f"**create_date de la oportunidad** (`{staff_vendido_fuente}`). "
         f"**Cierre Staff (misma base):** {fmt_money(staff_cierre_anual)}. "
         f"**Vendido Formación/Fábrica:** Ventas → Pedidos · Fecha del pedido = {periodo_label} · "
         f"Confirmado · Importe sin impuestos. "
@@ -1281,9 +1259,9 @@ with tab_vendedor:
 
     st.markdown("#### 📦 Órdenes confirmadas por vendedor, mes y línea (s/imp.)")
     st.caption(
-        "Para Staff, el cumplimiento de meta usa el **ingreso esperado de la oportunidad** "
-        "(`expected_revenue`) en el mes de **create_date** de la OV, no el amount_untaxed "
-        "ni las plazas vigentes."
+        "Para Staff, el cumplimiento de meta usa oportunidades **ganadas** "
+        "(`expected_revenue`) por **fecha de creación de la oportunidad** (como CRM), "
+        "no la fecha de la OV ni plazas vigentes."
     )
     scol = sales_amount_col(sales_vend)
     if sales_vend.empty or scol not in sales_vend.columns:
@@ -1303,8 +1281,8 @@ with st.sidebar.expander("Fuentes Odoo y pendientes"):
         """
 - **Plazas** → `firefly.staffing.request` (fallback: suscripciones)
 - **Renovaciones** → `firefly.staffing.history` (fallback: `sale.order.log`)
-- **Vendido Staff (KPI)** → `crm.lead.expected_revenue` (mes `create_date` de la OV)
-- **Cierre Staff (gráfico)** → misma base que el KPI (oportunidad · create_date)
+- **Vendido Staff (KPI)** → opp ganadas · `expected_revenue` · create_date oportunidad
+- **Cierre Staff (gráfico)** → misma base (como CRM Fecha de creación)
 - **Vendido Formación/Fábrica** → OV confirmadas por `date_order`, s/imp. en COP
 - **Facturado** → `account.move.line` tipo product, −`balance` (COP compañía)
 - **Leads / origen** → `crm.lead` + `source_id` (equipo CRM)

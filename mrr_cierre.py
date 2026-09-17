@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
-"""Cierre Staff — valor vendido en el mes de create_date de la OV.
+"""Cierre Staff — valor vendido por oportunidades ganadas.
 
 Regla de negocio:
-  Valor = `expected_revenue` de la oportunidad CRM **ganada**
-  (`sale.order.opportunity_id` con `won_status=won`).
-  Mes del gráfico = create_date de la OV.
+  Valor = `expected_revenue` de oportunidades CRM **ganadas** (`won_status=won`).
+  Mes del gráfico = **create_date de la oportunidad** (igual que CRM → Fecha de creación).
 
-  No entran oportunidades perdidas ni abiertas.
+  No entran perdidas ni abiertas.
+  No se usa create_date de la OV (eso desalinea febrero CRM 171M vs dashboard).
 
-  Fallback si no hay oportunidad ganada / expected_revenue=0:
-    MRR × ciclos mensuales + (MRR/30) × días (aniversarios start→end),
-    o amount_untaxed si no hay MRR.
+  Fallback si no hay ganadas en el período:
+    MRR × ciclos + (MRR/30)×días por OV (mes create_date de la OV),
+    o staffing.request.
 """
 
 from __future__ import annotations
@@ -32,11 +32,7 @@ from odoo_io import (
 
 
 def contract_duration(start, end) -> tuple[int, int]:
-    """(ciclos_mensuales, días_tras_último_aniversario). Fallback MRR.
-
-    11-ago → 16-oct → (3, 5);  8-sep → 15-dic → (4, 7).
-    Sin fin → (1, 0).
-    """
+    """(ciclos_mensuales, días_tras_último_aniversario). Fallback MRR."""
     if pd.isna(start):
         return 1, 0
     s = pd.Timestamp(start).normalize()
@@ -70,11 +66,7 @@ def contract_months(start, end) -> int:
 
 def valor_vendido_contrato(mrr, start, end, amount_untaxed=0.0,
                            expected_revenue=0.0) -> float:
-    """Valor vendido en el mes de create_date.
-
-    Preferencia: expected_revenue de la oportunidad → MRR×ciclos+(MRR/30)×días
-    → amount_untaxed.
-    """
+    """Fallback sin oportunidad ganada: MRR×ciclos+(MRR/30)×días o amount_untaxed."""
     try:
         opp = float(expected_revenue) if expected_revenue is not None and not pd.isna(expected_revenue) else 0.0
     except (TypeError, ValueError):
@@ -183,13 +175,58 @@ def plan_period_months(value, unit) -> float:
 # ── cálculo del gráfico ──────────────────────────────────────────────
 
 
+def cierre_from_won_opps(won_opps: pd.DataFrame, months: list[str],
+                         team_id: int | None = None) -> pd.DataFrame:
+    """Σ expected_revenue de ganadas por mes de create_date de la oportunidad."""
+    fuente = "crm.lead ganadas · expected_revenue · mes create_date (CRM)"
+    if not months:
+        return pd.DataFrame(columns=["mes", "vendido", "fuente"])
+    empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
+                          "fuente": [fuente] * len(months)})
+    if won_opps is None or won_opps.empty:
+        return empty
+
+    df = won_opps.copy()
+    if team_id is not None and "equipo_id" in df.columns:
+        df = df[pd.to_numeric(df["equipo_id"], errors="coerce") == int(team_id)]
+    elif team_id is not None and "linea" in df.columns:
+        df = df[df["linea"] == "Staff"]
+
+    if "mes" not in df.columns:
+        if "create_date" not in df.columns:
+            return empty
+        df["create_date"] = pd.to_datetime(df["create_date"], errors="coerce")
+        df = df[df["create_date"].notna()].copy()
+        df["mes"] = df["create_date"].dt.to_period("M").astype(str)
+
+    df = df[df["mes"].isin(months)].copy()
+    if df.empty:
+        return empty
+
+    rev = pd.to_numeric(df.get("expected_revenue", 0), errors="coerce").fillna(0.0)
+    df = df.assign(_rev=rev)
+    df = df[df["_rev"] > 0]
+    if df.empty:
+        return empty
+
+    por_mes = (
+        df.groupby("mes", as_index=False)["_rev"]
+        .sum()
+        .rename(columns={"_rev": "vendido"})
+    )
+    out = pd.DataFrame({"mes": months}).merge(por_mes, on="mes", how="left")
+    out["vendido"] = out["vendido"].fillna(0.0)
+    out["fuente"] = fuente
+    return out
+
+
 def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
                                   team_id: int | None = None,
                                   plans: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Suma en el mes de create_date: expected_revenue de la oportunidad."""
+    """Fallback: MRR / amount_untaxed por mes de create_date de la OV."""
     from odoo_io import _subscription_cierre_frame
 
-    fuente = "crm.lead.expected_revenue (solo ganadas · mes create_date)"
+    fuente = "fallback MRR×ciclos+(MRR/30)×días (sin opp ganadas)"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -220,21 +257,11 @@ def subscription_cierre_from_subs(subs: pd.DataFrame, months: list[str],
     end = sub["end_date"] if "end_date" in sub.columns else pd.Series(pd.NaT, index=sub.index)
     mrr = pd.to_numeric(sub.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
     untaxed = pd.to_numeric(sub.get("amount_untaxed", 0), errors="coerce").fillna(0.0)
-    opp = pd.to_numeric(sub.get("expected_revenue", 0), errors="coerce").fillna(0.0)
 
-    dur = [contract_duration(s, e) for s, e in zip(start, end)]
-    sub["meses_contrato"] = [d[0] for d in dur]
-    sub["dias_contrato"] = [d[1] for d in dur]
     sub["valor_vendido"] = [
-        valor_vendido_contrato(m, s, e, u, o)
-        for m, s, e, u, o in zip(mrr, start, end, untaxed, opp)
+        valor_vendido_contrato(m, s, e, u, 0.0)
+        for m, s, e, u in zip(mrr, start, end, untaxed)
     ]
-    # Marcar fuente mixta si alguna fila usó fallback.
-    used_opp = int((opp > 0).sum())
-    if used_opp == 0:
-        fuente = "fallback MRR×ciclos+(MRR/30)×días (sin expected_revenue)"
-    elif used_opp < len(sub):
-        fuente = "crm.lead.expected_revenue ganadas (+ fallback MRR si falta opp)"
 
     por_mes = (
         sub.groupby("mes", as_index=False)["valor_vendido"]
@@ -260,8 +287,13 @@ def log_cierre_monthly(logs: pd.DataFrame, months: list[str],
 def staff_cierre_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | None,
                          months: list[str], team_id: int | None = None,
                          logs: pd.DataFrame | None = None,
-                         plans: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Cierre comercial = expected_revenue de oportunidades ganadas (mes create_date)."""
+                         plans: pd.DataFrame | None = None,
+                         won_opps: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Cierre = ganadas por create_date de la opp; fallback OV/staffing."""
+    if won_opps is not None and not won_opps.empty:
+        out = cierre_from_won_opps(won_opps, months, team_id=team_id)
+        if float(out["vendido"].sum()) > 0:
+            return out
     if subs is not None and not subs.empty:
         out = subscription_cierre_from_subs(subs, months, team_id=team_id, plans=plans)
         if float(out["vendido"].sum()) > 0:
@@ -278,6 +310,7 @@ __all__ = [
     "contract_duration",
     "contract_months",
     "valor_vendido_contrato",
+    "cierre_from_won_opps",
     "log_cierre_monthly",
     "staff_cierre_monthly",
     "staff_cierre_detail",

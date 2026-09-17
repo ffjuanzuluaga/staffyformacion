@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
-_DATA_VERSION = 29
+_DATA_VERSION = 30
 
 
 def allowed_team_ids() -> set[int]:
@@ -706,6 +706,50 @@ def load_leads_full(date_from: str, date_to: str, team_ids: list[int]) -> pd.Dat
     df["origen"] = m2o_name(df["source_id"]) if "source_id" in df else "Sin asignar"
     df["linea"] = classify_linea(df)
     df["estado"] = df["won_status"].map({"won": "Ganada", "lost": "Perdida", "pending": "Abierta"})
+    return df
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando oportunidades ganadas (por create_date)...")
+def load_won_by_create(date_from: str, date_to: str, team_ids: list[int]) -> pd.DataFrame:
+    """Oportunidades ganadas agrupables como en CRM (Fecha de creación).
+
+    Solo `won_status=won`. El mes = create_date de la oportunidad (no date_closed
+    ni create_date de la OV).
+    """
+    domain = [
+        ("type", "=", "opportunity"),
+        ("won_status", "=", "won"),
+        ("create_date", ">=", date_from),
+        ("create_date", "<=", f"{date_to} 23:59:59"),
+        "|", ("active", "=", True), ("active", "=", False),
+    ]
+    if team_ids:
+        domain.append(("team_id", "in", team_ids))
+    fields = pick_fields(
+        "crm.lead",
+        ["name", "create_date", "date_closed", "user_id", "team_id", "partner_id",
+         "expected_revenue", "source_id", "won_status"],
+    )
+    try:
+        df = search_read("crm.lead", domain, fields, order="create_date")
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["create_date"] = pd.to_datetime(df["create_date"], errors="coerce")
+    df["date_closed"] = pd.to_datetime(df.get("date_closed"), errors="coerce")
+    df = df[df["create_date"].notna()].copy()
+    if df.empty:
+        return df
+    df["mes"] = df["create_date"].dt.to_period("M").astype(str)
+    df["vendedor"] = m2o_name(df["user_id"]) if "user_id" in df else "Sin asignar"
+    df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
+    df["equipo_id"] = m2o_id(df["team_id"]) if "team_id" in df else None
+    df["cliente"] = m2o_name(df["partner_id"]) if "partner_id" in df else "Sin asignar"
+    df["origen"] = m2o_name(df["source_id"]) if "source_id" in df else "Sin asignar"
+    df["linea"] = classify_linea(df)
+    df["expected_revenue"] = pd.to_numeric(df.get("expected_revenue", 0), errors="coerce").fillna(0.0)
+    df["opp_won_status"] = "won"
     return df
 
 
