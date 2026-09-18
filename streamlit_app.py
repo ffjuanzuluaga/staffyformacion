@@ -1122,9 +1122,9 @@ with tab_equipo:
     st.divider()
     st.markdown("#### ✅ Actividades del equipo por línea y mes (histórico real)")
     st.caption(
-        "Fuente: `crm.activity.report` (mensajes de chatter con tipo de actividad). "
-        "Mide presentación de negocio, propuesta, socialización y seguimiento — "
-        "y el resto de tipos que existan en Odoo."
+        "Fuente: `crm.activity.report` (actividades marcadas como hechas en el CRM). "
+        "Se muestran **todos** los tipos registrados en Odoo (seguimiento, propuesta, "
+        "socialización, etc.)."
     )
     act_hist, err_act_h = load_activity_report(d1, d2, team_ids)
     if err_act_h:
@@ -1132,10 +1132,13 @@ with tab_equipo:
     elif act_hist.empty:
         st.info("No hay actividades completadas en `crm.activity.report` este período. Paula: registrar actividades en el CRM.")
     else:
-        comercial = act_hist[act_hist["tipo"].map(es_tipo_comercial)]
-        usar = comercial if not comercial.empty else act_hist
-        if comercial.empty:
-            st.caption("No coincidió ningún tipo con presentación/propuesta/socialización/seguimiento. Se muestran todos.")
+        usar = act_hist
+        n_comercial = int(usar["tipo"].map(es_tipo_comercial).sum()) if "tipo" in usar.columns else 0
+        st.caption(
+            f"{len(usar)} actividades en el período · "
+            f"{usar['tipo'].nunique()} tipos distintos"
+            + (f" · {n_comercial} de foco comercial (propuesta/seguimiento/socialización)" if n_comercial else "")
+        )
         col3, col4 = st.columns(2)
         with col3:
             por_linea = usar.groupby(["mes", "linea"], as_index=False).agg(cantidad=("lead_id", "count"))

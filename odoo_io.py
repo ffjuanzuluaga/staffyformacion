@@ -11,6 +11,8 @@ Así se rescatan ventas/facturas aunque Paula aún no haya asignado el equipo.
 
 from __future__ import annotations
 
+import html
+import re
 import threading
 import unicodedata
 import xmlrpc.client
@@ -68,7 +70,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
-_DATA_VERSION = 33
+_DATA_VERSION = 34
 
 
 def allowed_team_ids() -> set[int]:
@@ -2037,8 +2039,10 @@ def load_hours_by_project(date_from: str, date_to: str, employee_ids: list[int])
 def load_activity_report(date_from: str, date_to: str, team_ids: list[int]):
     """Actividades YA hechas: crm.activity.report lee mail.message con
     mail_activity_type_id (Odoo no guarda mail.activity al completarlas)."""
-    cols = ["date", "mail_activity_type_id", "user_id", "team_id", "author_id",
-            "lead_id", "won_status"]
+    cols = [
+        "date", "mail_activity_type_id", "user_id", "team_id", "author_id",
+        "lead_id", "won_status", "body",
+    ]
     if "crm.activity.report" not in _models_exist(("crm.activity.report",)):
         return pd.DataFrame(columns=cols), (
             "crm.activity.report no está disponible. Se usará solo el backlog de mail.activity."
@@ -2050,18 +2054,55 @@ def load_activity_report(date_from: str, date_to: str, team_ids: list[int]):
     if team_ids:
         domain.append(("team_id", "in", team_ids))
     try:
-        df = search_read("crm.activity.report", domain, pick_fields("crm.activity.report", cols))
+        # lang español: los nombres de mail.activity.type traducidos coinciden con la UI.
+        df = search_read(
+            "crm.activity.report",
+            domain,
+            pick_fields("crm.activity.report", cols),
+            context={"lang": "es_CO"},
+        )
     except Exception as e:
         return pd.DataFrame(columns=cols), f"No se pudo leer crm.activity.report: {e}"
     if df.empty:
         return df, None
     df["date"] = pd.to_datetime(df["date"])
     df["mes"] = df["date"].dt.to_period("M").astype(str)
-    df["tipo"] = m2o_name(df["mail_activity_type_id"]) if "mail_activity_type_id" in df else "Sin tipo"
+    tipo_m2o = (
+        m2o_name(df["mail_activity_type_id"])
+        if "mail_activity_type_id" in df.columns
+        else pd.Series(["Sin tipo"] * len(df), index=df.index)
+    )
+    # La UI de Odoo muestra el texto del body ("Propuesta … hecho"); a veces es
+    # más fiel que el nombre crudo del many2one vía XML-RPC.
+    if "body" in df.columns:
+        tipo_body = df["body"].map(_tipo_desde_body_actividad)
+        df["tipo"] = tipo_body.where(tipo_body.notna() & (tipo_body != ""), tipo_m2o)
+    else:
+        df["tipo"] = tipo_m2o
     df["vendedor"] = m2o_name(df["user_id"]) if "user_id" in df else "Sin asignar"
     df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
     df["linea"] = classify_linea(df)
     return df, None
+
+
+def _tipo_desde_body_actividad(body) -> str | None:
+    """Extrae el nombre del tipo desde el mensaje 'X hecho' del chatter."""
+    if body is None or body is False or (isinstance(body, float) and pd.isna(body)):
+        return None
+    text = str(body)
+    if not text.strip():
+        return None
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    m = re.search(r"(.+?)\s+hecho\b", text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    nombre = m.group(1).strip(" -:·|")
+    # Evitar basura demasiado larga (body con notas largas).
+    if not nombre or len(nombre) > 80:
+        return None
+    return nombre
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando actividades pendientes...")
