@@ -70,7 +70,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
-_DATA_VERSION = 34
+_DATA_VERSION = 35
 
 
 def allowed_team_ids() -> set[int]:
@@ -2107,31 +2107,53 @@ def _tipo_desde_body_actividad(body) -> str | None:
 
 @st.cache_data(ttl=600, show_spinner="Cargando actividades pendientes...")
 def load_team_activities(team_ids: list[int]):
+    """Pendientes abiertas sobre oportunidades (`mail.activity` / crm.lead).
+
+    El equipo se toma del **asignado** (`user_id` ∈ `crm.team.member_ids`), igual
+    que el filtro de Odoo «Asignada a → Equipos de ventas». No usa el team_id de
+    la oportunidad. Si alguien está en 2 equipos, la actividad cuenta en ambos
+    (como al filtrar cada equipo por separado en Odoo).
+    """
     cols = ["res_id", "activity_type_id", "user_id", "date_deadline", "create_date"]
     try:
         df = search_read("mail.activity", [("res_model", "=", "crm.lead")], cols)
     except Exception as e:
         return pd.DataFrame(columns=cols), f"No se pudo consultar mail.activity: {e}"
-    if df.empty:
-        return df, None
+    if df.empty or not team_ids:
+        return pd.DataFrame(columns=cols + ["equipo", "equipo_id", "tipo", "vendedor", "mes", "linea"]), None
+
     df["tipo"] = m2o_name(df["activity_type_id"])
     df["vendedor"] = m2o_name(df["user_id"])
+    df["user_id_int"] = m2o_id(df["user_id"])
     df["date_deadline"] = pd.to_datetime(df["date_deadline"])
     df["mes"] = df["date_deadline"].dt.to_period("M").astype(str)
-    res_ids = sorted({int(rid) for rid in df["res_id"].dropna().unique()})
-    leads_domain = [("id", "in", res_ids)]
-    if team_ids:
-        leads_domain.append(("team_id", "in", team_ids))
-    leads_teams = (
-        search_read("crm.lead", leads_domain, ["id", "team_id"])
-        if res_ids else pd.DataFrame(columns=["id", "team_id"])
-    )
-    if leads_teams.empty:
+
+    teams = search_read("crm.team", [("id", "in", list(team_ids))], ["id", "name", "member_ids"])
+    if teams.empty:
         return df.iloc[0:0], None
-    leads_teams["equipo"] = m2o_name(leads_teams["team_id"])
-    df = df.merge(leads_teams[["id", "equipo"]], left_on="res_id", right_on="id", how="inner")
-    df["linea"] = classify_linea(df)
-    return df, None
+
+    member_rows = []
+    for _, team in teams.iterrows():
+        for uid in (team.get("member_ids") or []):
+            try:
+                member_rows.append({
+                    "user_id_int": int(uid),
+                    "equipo": str(team["name"]),
+                    "equipo_id": int(team["id"]),
+                })
+            except (TypeError, ValueError):
+                continue
+    if not member_rows:
+        return df.iloc[0:0], None
+
+    members_df = pd.DataFrame(member_rows).drop_duplicates()
+    out = df.merge(members_df, on="user_id_int", how="inner")
+    if out.empty:
+        return out, None
+
+    # Línea comercial a partir del nombre del equipo de ventas del asignado.
+    out["linea"] = out["equipo"].map(linea_from_team_name).fillna("Sin línea")
+    return out.drop(columns=["user_id_int"], errors="ignore"), None
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando horas de reuniones CRM (calendario)...")

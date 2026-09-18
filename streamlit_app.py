@@ -1159,18 +1159,29 @@ with tab_equipo:
             )
 
     st.markdown("#### ⏳ Backlog de actividades pendientes (foto de hoy)")
-    st.caption("Odoo borra `mail.activity` al completarlas. Esto es solo lo que sigue abierto.")
+    st.caption(
+        "Solo **Lead/Oportunidad** (no Pedido de Venta). "
+        "Equipo = **equipo de ventas del asignado** (`crm.team.member_ids`), "
+        "igual que en Odoo «Asignada a → Equipos de ventas». "
+        "Mes = fecha límite. Odoo borra la actividad al completarla."
+    )
     actividades, err_act = load_team_activities(team_ids)
     if err_act:
         st.warning(err_act)
     elif actividades.empty:
-        st.info("No hay actividades pendientes sobre oportunidades.")
+        st.info("No hay actividades pendientes sobre oportunidades asignadas a miembros de estos equipos.")
     else:
         por_linea_mes = actividades.groupby(["mes", "equipo"], as_index=False).agg(cantidad=("res_id", "count"))
         fig = px.bar(por_linea_mes, x="mes", y="cantidad", color="equipo", barmode="group",
-                     title="Pendientes por línea y mes de vencimiento",
+                     title="Pendientes por equipo del asignado y mes de vencimiento",
                      labels={"cantidad": "Actividades", "mes": "Mes"})
         st.plotly_chart(fig, use_container_width=True)
+        with st.expander("Detalle pendientes (para cuadrar con Odoo)"):
+            show = [c for c in ["mes", "equipo", "tipo", "vendedor", "date_deadline", "res_id"] if c in actividades.columns]
+            st.dataframe(
+                actividades[show].sort_values(["mes", "equipo", "date_deadline"]),
+                use_container_width=True, hide_index=True,
+            )
 
     st.divider()
     st.markdown("#### 🕑 Horas dedicadas a cada actividad (reuniones de calendario)")
