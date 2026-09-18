@@ -70,7 +70,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
-_DATA_VERSION = 35
+_DATA_VERSION = 36
 
 
 def allowed_team_ids() -> set[int]:
@@ -2106,54 +2106,81 @@ def _tipo_desde_body_actividad(body) -> str | None:
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando actividades pendientes...")
-def load_team_activities(team_ids: list[int]):
+def load_team_activities(team_ids: list[int], _v: int = _DATA_VERSION):
     """Pendientes abiertas sobre oportunidades (`mail.activity` / crm.lead).
 
-    El equipo se toma del **asignado** (`user_id` ∈ `crm.team.member_ids`), igual
-    que el filtro de Odoo «Asignada a → Equipos de ventas». No usa el team_id de
-    la oportunidad. Si alguien está en 2 equipos, la actividad cuenta en ambos
-    (como al filtrar cada equipo por separado en Odoo).
+    Equipo = mismo criterio que Odoo «Asignada a → Equipos de ventas»:
+      - `user_id.sale_team_id` = equipo, o
+      - `user_id` ∈ `crm.team.member_ids`.
+    Solo `res_model=crm.lead` (no Pedido de Venta). Mes = `date_deadline`.
     """
-    cols = ["res_id", "activity_type_id", "user_id", "date_deadline", "create_date"]
-    try:
-        df = search_read("mail.activity", [("res_model", "=", "crm.lead")], cols)
-    except Exception as e:
-        return pd.DataFrame(columns=cols), f"No se pudo consultar mail.activity: {e}"
-    if df.empty or not team_ids:
-        return pd.DataFrame(columns=cols + ["equipo", "equipo_id", "tipo", "vendedor", "mes", "linea"]), None
+    empty_cols = [
+        "res_id", "activity_type_id", "user_id", "date_deadline", "create_date",
+        "equipo", "equipo_id", "tipo", "vendedor", "mes", "linea",
+    ]
+    if not team_ids:
+        return pd.DataFrame(columns=empty_cols), None
 
-    df["tipo"] = m2o_name(df["activity_type_id"])
-    df["vendedor"] = m2o_name(df["user_id"])
-    df["user_id_int"] = m2o_id(df["user_id"])
-    df["date_deadline"] = pd.to_datetime(df["date_deadline"])
-    df["mes"] = df["date_deadline"].dt.to_period("M").astype(str)
-
-    teams = search_read("crm.team", [("id", "in", list(team_ids))], ["id", "name", "member_ids"])
+    teams = search_read(
+        "crm.team",
+        [("id", "in", [int(t) for t in team_ids])],
+        ["id", "name", "member_ids"],
+        limit=100,
+    )
     if teams.empty:
-        return df.iloc[0:0], None
+        return pd.DataFrame(columns=empty_cols), None
 
-    member_rows = []
+    frames = []
     for _, team in teams.iterrows():
-        for uid in (team.get("member_ids") or []):
-            try:
-                member_rows.append({
-                    "user_id_int": int(uid),
-                    "equipo": str(team["name"]),
-                    "equipo_id": int(team["id"]),
-                })
-            except (TypeError, ValueError):
+        tid = int(team["id"])
+        tname = str(team["name"])
+        members = [int(u) for u in (team.get("member_ids") or []) if u is not False and u is not None]
+        # Dominio alineado al filtro de Odoo por equipo del asignado.
+        domain = [
+            ("res_model", "=", "crm.lead"),
+            "|",
+            ("user_id.sale_team_id", "=", tid),
+            ("user_id", "in", members if members else [0]),
+        ]
+        try:
+            part = search_read(
+                "mail.activity",
+                domain,
+                ["res_id", "activity_type_id", "user_id", "date_deadline", "create_date"],
+                limit=5000,
+            )
+        except Exception:
+            # Fallback si sale_team_id no es filtrable vía XML-RPC.
+            if not members:
                 continue
-    if not member_rows:
-        return df.iloc[0:0], None
+            try:
+                part = search_read(
+                    "mail.activity",
+                    [("res_model", "=", "crm.lead"), ("user_id", "in", members)],
+                    ["res_id", "activity_type_id", "user_id", "date_deadline", "create_date"],
+                    limit=5000,
+                )
+            except Exception as e:
+                return pd.DataFrame(columns=empty_cols), f"No se pudo consultar mail.activity: {e}"
+        if part.empty:
+            continue
+        part = part.copy()
+        part["equipo"] = tname
+        part["equipo_id"] = tid
+        frames.append(part)
 
-    members_df = pd.DataFrame(member_rows).drop_duplicates()
-    out = df.merge(members_df, on="user_id_int", how="inner")
-    if out.empty:
-        return out, None
+    if not frames:
+        return pd.DataFrame(columns=empty_cols), None
 
-    # Línea comercial a partir del nombre del equipo de ventas del asignado.
+    out = pd.concat(frames, ignore_index=True)
+    # Misma actividad + mismo equipo no se duplica; sí puede estar en 2 equipos.
+    out = out.drop_duplicates(subset=["id", "equipo_id"] if "id" in out.columns else ["res_id", "user_id", "date_deadline", "equipo_id"])
+    out["tipo"] = m2o_name(out["activity_type_id"])
+    out["vendedor"] = m2o_name(out["user_id"])
+    out["date_deadline"] = pd.to_datetime(out["date_deadline"])
+    out["mes"] = out["date_deadline"].dt.to_period("M").astype(str)
     out["linea"] = out["equipo"].map(linea_from_team_name).fillna("Sin línea")
-    return out.drop(columns=["user_id_int"], errors="ignore"), None
+    return out, None
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando horas de reuniones CRM (calendario)...")

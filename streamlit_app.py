@@ -1161,9 +1161,9 @@ with tab_equipo:
     st.markdown("#### ⏳ Backlog de actividades pendientes (foto de hoy)")
     st.caption(
         "Solo **Lead/Oportunidad** (no Pedido de Venta). "
-        "Equipo = **equipo de ventas del asignado** (`crm.team.member_ids`), "
-        "igual que en Odoo «Asignada a → Equipos de ventas». "
-        "Mes = fecha límite. Odoo borra la actividad al completarla."
+        "Equipo = filtro Odoo «Asignada a → Equipos de ventas» "
+        "(`sale_team_id` del usuario o miembro del equipo). "
+        "Mes = fecha límite. Pulsa **Refrescar datos** si los números no cambian."
     )
     actividades, err_act = load_team_activities(team_ids)
     if err_act:
@@ -1176,6 +1176,16 @@ with tab_equipo:
                      title="Pendientes por equipo del asignado y mes de vencimiento",
                      labels={"cantidad": "Actividades", "mes": "Mes"})
         st.plotly_chart(fig, use_container_width=True)
+        # Totales por equipo (para cuadrar con el contador de Odoo al filtrar cada equipo)
+        tot_eq = (
+            actividades.groupby("equipo", as_index=False)
+            .agg(pendientes=("res_id", "count"))
+            .sort_values("pendientes", ascending=False)
+        )
+        st.caption(
+            "Totales abiertos por equipo (todas las fechas límite): "
+            + " · ".join(f"{r.equipo}={int(r.pendientes)}" for r in tot_eq.itertuples())
+        )
         with st.expander("Detalle pendientes (para cuadrar con Odoo)"):
             show = [c for c in ["mes", "equipo", "tipo", "vendedor", "date_deadline", "res_id"] if c in actividades.columns]
             st.dataframe(
