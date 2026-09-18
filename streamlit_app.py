@@ -2,8 +2,8 @@
 """
 Dashboard de las líneas Staff, Formación y Fábrica de Software.
 Conectado a Odoo 19 vía XML-RPC. Extrae CRM, ventas, facturas,
-firefly.staffing.request, suscripciones, proyectos (service_line),
-analítica y crm.activity.report.
+sale.order Staff (firefly_sale_staff), suscripciones, proyectos
+(service_line), analítica y crm.activity.report.
 
 Las 6 preguntas del informe están contestadas en la pestaña Resumen.
 """
@@ -33,8 +33,8 @@ from odoo_io import (
     load_projects,
     load_sales,
     load_sales_team_employees,
-    load_staffing_renewals,
-    load_staffing_requests,
+    load_staff_sale_orders,
+    load_staff_sale_renewals,
     load_subscription_logs,
     load_subscriptions,
     load_team_activities,
@@ -316,10 +316,10 @@ if not invoices_all.empty and "equipo" in invoices_all.columns:
                     )
 
 costos_analytic, err_costo = load_analytic_costs(d1, d2)
-staff_req, err_staff = load_staffing_requests()
+staff_req, err_staff = load_staff_sale_orders()
 staff_team_id = team_id_for_linea(teams_df, "Staff")
 subs_df, err_subs = load_subscriptions(staff_team_id)
-renewals, err_ren = load_staffing_renewals(d1, d2)
+renewals, err_ren = load_staff_sale_renewals(d1, d2)
 sub_logs, err_logs = load_subscription_logs(d1, d2, team_ids)
 mrr_report, err_mrr_report = load_sale_order_log_report(d1, d2, team_ids)
 sub_plans = load_subscription_plans()
@@ -747,8 +747,12 @@ with tab_resumen:
     plazas_hoy = 0
     fuente_plazas = "suscripciones"
     if staff_req is not None and not staff_req.empty:
-        plazas_hoy = int((staff_req["state"] == "confirmed").sum())
-        fuente_plazas = "firefly.staffing.request (confirmadas)"
+        act = staff_req[staff_req["state"] == "confirmed"] if "state" in staff_req.columns else staff_req
+        if "chain_id" in act.columns:
+            plazas_hoy = int(act["chain_id"].nunique())
+        else:
+            plazas_hoy = int(len(act))
+        fuente_plazas = "sale.order Staff (firefly_sale_staff · service_line=staff)"
         hist_plazas = staffing_coverage(staff_req, meses_12)
         proy_plazas = staffing_coverage(staff_req, meses_6fwd, states=("confirmed",))
     elif subs_df is not None and not subs_df.empty:
@@ -790,8 +794,8 @@ with tab_resumen:
                 fmt_money(neto),
             )
     st.caption(
-        "Staff: ingreso mensual de plazas − costo del recurso (proveedor) − fijo de Diego "
-        "(módulo `firefly_staffing`). Formación y Fábrica: facturado − analítica − fijo. "
+        "Staff: ingreso mensual (`recurring_monthly`) − `staff_purchase_amount` − fijo Diego "
+        "(`sale.order` Staff / firefly_sale_staff). Formación y Fábrica: facturado − analítica − fijo. "
         "El costo de Diego/Paula está en 0 hasta que Raquel confirme el valor."
     )
 
@@ -892,7 +896,11 @@ with tab_resumen:
 # --- Staff --------------------------------------------------------------
 with tab_staff:
     if staff_req is not None and not staff_req.empty:
-        plazas_actuales = int((staff_req["state"] == "confirmed").sum())
+        act = staff_req[staff_req["state"] == "confirmed"] if "state" in staff_req.columns else staff_req
+        if "chain_id" in act.columns:
+            plazas_actuales = int(act["chain_id"].nunique())
+        else:
+            plazas_actuales = int(len(act))
     elif subs_df is not None and not subs_df.empty:
         plazas_actuales = int(subs_df["subscription_state"].isin(["3_progress", "4_paused"]).sum())
     else:
@@ -907,7 +915,7 @@ with tab_staff:
     if staff_req is not None and not staff_req.empty:
         historico = staffing_coverage(staff_req, meses_12)
         proyeccion = staffing_coverage(staff_req, meses_6fwd, states=("confirmed",))
-        fuente = "vigencia `date_start`/`date_end` de firefly.staffing.request"
+        fuente = "vigencia `start_date`/`end_date` de sale.order Staff (firefly_sale_staff)"
     elif subs_df is not None and not subs_df.empty:
         historico = subscription_coverage(subs_df, meses_12)
         proyeccion = subscription_coverage(subs_df, meses_6fwd)
@@ -917,7 +925,7 @@ with tab_staff:
         proyeccion = pd.DataFrame()
         fuente = ""
     if historico.empty:
-        st.info("Sin solicitudes Staff ni suscripciones para graficar plazas.")
+        st.info("Sin suscripciones Staff (service_line=staff) ni fallback de equipo para graficar plazas.")
         if err_staff:
             st.warning(err_staff)
         if err_subs:
@@ -939,7 +947,7 @@ with tab_staff:
     if renewals is not None and not renewals.empty:
         ren_mes = renewals.groupby("mes", as_index=False).agg(renovaciones=("staff", "count"))
         fig = px.bar(ren_mes, x="mes", y="renovaciones", text_auto=True,
-                     title="Renovaciones Staff (firefly.staffing.history)",
+                     title="Renovaciones Staff (firefly.sale.staff.history)",
                      labels={"renovaciones": "Renovaciones", "mes": "Mes"})
         st.plotly_chart(fig, use_container_width=True)
     elif sub_logs is not None and not sub_logs.empty:
@@ -958,8 +966,8 @@ with tab_staff:
 
     st.markdown("#### 💵 Rentabilidad operativa de Staff (plaza vs. recurso)")
     st.caption(
-        "Por cada mes de vigencia: valor mensual a cobrar − valor mensual a pagar al proveedor "
-        "− costo fijo de Diego. Es el 'cuánto vale el recurso' que pidió el informe."
+        "Por cada mes de vigencia: `recurring_monthly` (COP) − `staff_purchase_amount` (COP) "
+        "− costo fijo de Diego. Una plaza = una cadena de suscripción (`origin_order_id`)."
     )
     if staff_req is not None and not staff_req.empty:
         pnl = staffing_pnl_monthly(staff_req, months_year, costo_fijo_de(costos_fijos, "Staff"))
@@ -967,17 +975,10 @@ with tab_staff:
                      title="Staff — neto operativo mensual (plazas − recurso − Diego)",
                      labels={"neto": "COP", "mes": "Mes"})
         st.plotly_chart(fig, use_container_width=True)
-        col_x, col_y = st.columns(2)
-        with col_x:
-            fig = px.bar(pnl, x="mes", y=["ingreso_plazas", "costo_recurso"], barmode="group",
-                         title="Ingreso de plazas vs. costo del recurso",
-                         labels={"value": "COP", "mes": "Mes", "variable": ""})
-            st.plotly_chart(fig, use_container_width=True)
-        with col_y:
-            fig = px.line(pnl, x="mes", y="valor_recurso_promedio", markers=True,
-                          title="Costo promedio del recurso / plaza",
-                          labels={"valor_recurso_promedio": "COP", "mes": "Mes"})
-            st.plotly_chart(fig, use_container_width=True)
+        fig = px.bar(pnl, x="mes", y=["ingreso_plazas", "costo_recurso"], barmode="group",
+                     title="Ingreso de plazas vs. costo del recurso",
+                     labels={"value": "COP", "mes": "Mes", "variable": ""})
+        st.plotly_chart(fig, use_container_width=True)
         with st.expander("Detalle P&L operativo Staff"):
             st.dataframe(
                 pnl, use_container_width=True, hide_index=True,
@@ -987,25 +988,30 @@ with tab_staff:
                     "costo_recurso": st.column_config.NumberColumn("Costo recurso", format="$%,.0f"),
                     "costo_fijo": st.column_config.NumberColumn("Costo fijo Diego", format="$%,.0f"),
                     "neto": st.column_config.NumberColumn("Neto", format="$%,.0f"),
-                    "valor_recurso_promedio": st.column_config.NumberColumn("Recurso promedio", format="$%,.0f"),
                 },
             )
-        with st.expander("Plazas / solicitudes Staff"):
+        with st.expander("Plazas Staff (sale.order · firefly_sale_staff)"):
             show_cols = [c for c in [
-                "name", "cliente", "rol", "recurso", "state", "date_start", "date_end",
+                "name", "cliente", "rol", "recurso", "subscription_state", "state",
+                "start_date", "end_date", "chain_id",
                 "monthly_amount_company_currency", "purchase_amount_company_currency",
-                "margin_company_currency",
+                "margin_company_currency", "staff_purchase_amount", "recurring_monthly",
             ] if c in staff_req.columns]
             st.dataframe(
                 staff_req[show_cols], use_container_width=True, hide_index=True,
                 column_config={
-                    "monthly_amount_company_currency": st.column_config.NumberColumn("Venta mes", format="$%,.0f"),
-                    "purchase_amount_company_currency": st.column_config.NumberColumn("Costo recurso", format="$%,.0f"),
+                    "monthly_amount_company_currency": st.column_config.NumberColumn("Venta mes COP", format="$%,.0f"),
+                    "purchase_amount_company_currency": st.column_config.NumberColumn("Costo recurso COP", format="$%,.0f"),
                     "margin_company_currency": st.column_config.NumberColumn("Margen", format="$%,.0f"),
+                    "staff_purchase_amount": st.column_config.NumberColumn("Pagar / mes", format="%,.0f"),
+                    "recurring_monthly": st.column_config.NumberColumn("MRR", format="%,.0f"),
                 },
             )
     else:
-        st.info("Sin `firefly.staffing.request`. Se muestra solo la rentabilidad contable (abajo).")
+        st.info(
+            "Sin suscripciones `service_line=staff`. Verifica firefly_sale_staff / "
+            "l10n_co_firefly_project. Se muestra solo la rentabilidad contable (abajo)."
+        )
 
     chart_rentabilidad_contable("Staff")
 
@@ -1298,12 +1304,12 @@ with tab_vendedor:
 with st.sidebar.expander("Fuentes Odoo y pendientes"):
     st.markdown(
         """
-- **Plazas** → `firefly.staffing.request` (fallback: suscripciones)
-- **Renovaciones** → `firefly.staffing.history` (fallback: `sale.order.log`)
+- **Plazas** → `sale.order` con `service_line=staff` (firefly_sale_staff); 1 plaza = cadena `origin_order_id`
+- **Renovaciones** → `firefly.sale.staff.history` (`event_type=renewal`; fallback: `sale.order.log`)
 - **Vendido / Cierre Staff** → opp **ganadas** · `expected_revenue` · **date_closed** (cuando se ganó)
 - **Cierres CRM (todas las líneas)** → misma fecha: date_closed · won
 - **Vendido Formación/Fábrica** → OV confirmadas · `date_order` · s/imp. COP
-- **Neto YTD Staff** → plazas vigentes (ingreso − proveedor − fijo); *no* es el vendido CRM
+- **Neto YTD Staff** → plazas vigentes (`recurring_monthly` − `staff_purchase_amount` − fijo); *no* es el vendido CRM
 - **Facturado** → `account.move.line` product · −balance COP
 - **Leads / origen** → `crm.lead` + `source_id` (equipo CRM)
 - **Cursos/proyectos entregados** → `project.project.service_line` (fecha fin = proxy)

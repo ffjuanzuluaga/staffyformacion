@@ -46,11 +46,11 @@ Cuentas analíticas: `Staffing IT`, `Formación TI`, `Fábrica Software`.
 
 | Indicador | Modelo / campo |
 |---|---|
-| Plazas activas y proyección | `firefly.staffing.request` (`date_start`/`date_end`, estado confirmado). Fallback: `sale.order` con `is_subscription` |
-| Renovaciones del mes | `firefly.staffing.history` (`event_type=renewal`). Fallback: `sale.order.log` transferencias |
-| Rentabilidad Staff (recurso) | Valor mensual a cobrar − valor a pagar al proveedor − fijo de Diego |
+| Plazas activas y proyección | `sale.order` con `service_line=staff` (firefly_sale_staff): `start_date`/`end_date`, estados activos; 1 plaza = cadena `origin_order_id`. Fallback: suscripciones por equipo |
+| Renovaciones del mes | `firefly.sale.staff.history` (`event_type=renewal`). Fallback: `sale.order.log` transferencias |
+| Rentabilidad Staff (recurso) | `recurring_monthly` − `staff_purchase_amount` − fijo de Diego (COP) |
 | Vendido / Cierre Staff | Oportunidades **ganadas** (`won_status=won`): Σ `expected_revenue` por mes de **`date_closed`** (fecha en que se marcó Ganado). No usa OV ni MRR |
-| Neto YTD Staff (rentabilidad) | Plazas vigentes: ingreso mensual − costo proveedor − fijo Diego (`firefly.staffing.request`). Indicador distinto del vendido CRM |
+| Neto YTD Staff (rentabilidad) | Plazas vigentes vía firefly_sale_staff: ingreso − proveedor − fijo Diego. Indicador distinto del vendido CRM |
 | Cierre Staff (mes a mes) | Misma base que Vendido Staff |
 | Vendido Formación / Fábrica | `sale.order` confirmadas por **`date_order`**, s/imp. en **COP** = `amount_untaxed / currency_rate`. Si la OV está en USD sin TRM (`currency_rate≈1`), se avisa y no se convierte |
 | Facturación | `account.move` posted por **`invoice_date`**, **antes de impuestos** (`amount_untaxed_signed`; NC restan). Cuadra con Base imponible / Importe sin impuestos |

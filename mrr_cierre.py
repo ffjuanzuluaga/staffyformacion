@@ -9,7 +9,7 @@ Regla de negocio:
   No se usa create_date de la OV ni create_date de la oportunidad.
 
   Fallback si won_opps es None (legado):
-    MRR × ciclos + (MRR/30)×días por OV, o staffing.request.
+    MRR × ciclos + (MRR/30)×días por OV, o sale.order Staff.
 """
 
 from __future__ import annotations

@@ -68,7 +68,7 @@ OTHER_TEAMS_NORM = {
 # id=5 TRANSFORMACION DIGITAL en Firefly (no es Formación).
 OTHER_TEAM_IDS = {5}
 # Bust de caché Streamlit cuando cambia la lógica de clasificación / vendido Staff.
-_DATA_VERSION = 32
+_DATA_VERSION = 33
 
 
 def allowed_team_ids() -> set[int]:
@@ -1089,6 +1089,161 @@ def load_staffing_renewals(date_from: str, date_to: str):
     return df, None
 
 
+# ── Staff vía firefly_sale_staff (sale.order service_line=staff) ─────────
+
+_STAFF_STATE_RANK = {
+    "3_progress": 0, "4_paused": 1, "6_churn": 2, "5_renewed": 3,
+    "confirmed": 0, "done": 2,
+}
+
+
+def _staff_one_per_chain(df: pd.DataFrame) -> pd.DataFrame:
+    """Una fila por cadena de contrato (origin_order_id); prioriza en progreso."""
+    if df is None or df.empty or "chain_id" not in df.columns:
+        return df if df is not None else pd.DataFrame()
+    out = df.copy()
+    if "subscription_state" in out.columns:
+        out["_rank"] = out["subscription_state"].map(_STAFF_STATE_RANK).fillna(9)
+    elif "state" in out.columns:
+        out["_rank"] = out["state"].map(_STAFF_STATE_RANK).fillna(9)
+    else:
+        out["_rank"] = 5
+    out = out.sort_values(["chain_id", "_rank", "id"] if "id" in out.columns else ["chain_id", "_rank"])
+    return out.drop_duplicates(subset=["chain_id"], keep="first").drop(columns=["_rank"], errors="ignore")
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando plazas Staff (sale.order · firefly_sale_staff)...")
+def load_staff_sale_orders():
+    """Plazas Staff desde suscripciones `service_line=staff` (módulo firefly_sale_staff).
+
+    Reemplaza `firefly.staffing.request`. Columnas normalizadas para cobertura/P&L:
+      date_start/date_end, state (confirmed|done), monthly/purchase*_company_currency.
+    """
+    have = available_fields("sale.order")
+    if "service_line" not in have:
+        return pd.DataFrame(), (
+            "sale.order no tiene `service_line`. Instala l10n_co_firefly_project / firefly_sale_staff."
+        )
+    wanted = [
+        "name", "partner_id", "user_id", "team_id", "state", "subscription_state",
+        "start_date", "end_date", "origin_order_id", "service_line",
+        "recurring_monthly", "amount_untaxed", "currency_id", "currency_rate",
+        "staff_role_id", "staff_profile", "staff_resource_partner_id",
+        "staff_purchase_amount", "staff_purchase_currency_id",
+        "plan_id", "is_subscription", "date_order",
+    ]
+    fields = pick_fields("sale.order", wanted)
+    domain = [("service_line", "=", "staff")]
+    try:
+        df = search_read(
+            "sale.order", domain, fields,
+            context={"active_test": False},
+            order="start_date desc",
+        )
+    except Exception as e:
+        return pd.DataFrame(), f"No se pudo leer sale.order Staff: {e}"
+    if df.empty:
+        return df, None
+
+    df["cliente"] = m2o_name(df["partner_id"]) if "partner_id" in df else "Sin asignar"
+    df["responsable"] = m2o_name(df["user_id"]) if "user_id" in df else "Sin asignar"
+    df["equipo"] = m2o_name(df["team_id"]) if "team_id" in df else "Sin asignar"
+    df["equipo_id"] = m2o_id(df["team_id"]) if "team_id" in df else None
+    df["rol"] = m2o_name(df["staff_role_id"]) if "staff_role_id" in df else "Sin rol"
+    df["recurso"] = (
+        m2o_name(df["staff_resource_partner_id"])
+        if "staff_resource_partner_id" in df else "Sin recurso"
+    )
+    df["start_date"] = pd.to_datetime(df.get("start_date"), errors="coerce")
+    df["end_date"] = pd.to_datetime(df.get("end_date"), errors="coerce")
+    df["date_start"] = df["start_date"]
+    df["date_end"] = df["end_date"]
+
+    # Cadena = 1 plaza comercial
+    origin = m2o_id(df["origin_order_id"]) if "origin_order_id" in df else pd.Series([pd.NA] * len(df))
+    ids = pd.to_numeric(df.get("id"), errors="coerce")
+    df["chain_id"] = origin.fillna(ids).astype("Int64")
+
+    # Estado compatible con coverage: confirmed = activa, done = cerrada/histórica
+    sub_st = df.get("subscription_state", pd.Series([None] * len(df))).fillna("").astype(str)
+    df["state"] = "other"
+    df.loc[sub_st.isin(SUB_ACTIVE_STATES), "state"] = "confirmed"
+    df.loc[sub_st.isin(("6_churn", "5_renewed")), "state"] = "done"
+
+    # Ingreso mensual COP (recurring_monthly)
+    mrr = pd.to_numeric(df.get("recurring_monthly", 0), errors="coerce").fillna(0.0)
+    untaxed = pd.to_numeric(df.get("amount_untaxed", 0), errors="coerce").fillna(0.0)
+    ingreso = mrr.where(mrr > 0, untaxed)
+    rate = pd.to_numeric(df.get("currency_rate", 1), errors="coerce").replace(0, pd.NA).fillna(1.0)
+    company_cur = company_currency_id()
+    cur_ids = m2o_id(df["currency_id"]) if "currency_id" in df else pd.Series([None] * len(df))
+    if company_cur:
+        same_cur = cur_ids.isna() | (cur_ids.astype("Int64") == company_cur)
+        foreign_flat = (~same_cur) & (rate.sub(1.0).abs() < 1e-12)
+        df["monthly_amount_company_currency"] = ingreso.where(same_cur | foreign_flat, ingreso / rate)
+        df.loc[foreign_flat, "monthly_amount_company_currency"] = ingreso.loc[foreign_flat]
+    else:
+        df["monthly_amount_company_currency"] = ingreso
+
+    # Costo proveedor COP (staff_purchase_amount)
+    purchase = pd.to_numeric(df.get("staff_purchase_amount", 0), errors="coerce").fillna(0.0)
+    purch_cur = (
+        m2o_id(df["staff_purchase_currency_id"])
+        if "staff_purchase_currency_id" in df
+        else pd.Series([None] * len(df))
+    )
+    if company_cur:
+        same_p = purch_cur.isna() | (purch_cur.astype("Int64") == company_cur)
+        same_as_so = (
+            purch_cur.notna() & cur_ids.notna()
+            & (purch_cur.astype("Int64") == cur_ids.astype("Int64"))
+        )
+        costo = purchase.copy()
+        convert = (~same_p) & same_as_so & (rate.sub(1.0).abs() >= 1e-12)
+        costo.loc[convert] = (purchase / rate).loc[convert]
+        # Misma moneda compañía o sin conversión posible: valor nominal
+        df["purchase_amount_company_currency"] = costo
+    else:
+        df["purchase_amount_company_currency"] = purchase
+
+    df["margin_company_currency"] = (
+        df["monthly_amount_company_currency"] - df["purchase_amount_company_currency"]
+    )
+    df["plan"] = m2o_name(df["plan_id"]) if "plan_id" in df else ""
+    df["fuente_staff"] = "sale.order · firefly_sale_staff (service_line=staff)"
+    return df, None
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando renovaciones Staff (firefly_sale_staff)...")
+def load_staff_sale_renewals(date_from: str, date_to: str):
+    """Renovaciones desde `firefly.sale.staff.history` (reemplaza firefly.staffing.history)."""
+    model = "firefly.sale.staff.history"
+    cols = ["date", "event_type", "staff_sale_order_id", "notes", "user_id", "old_value", "new_value"]
+    if model not in _models_exist((model,)):
+        # Fallback legacy
+        return load_staffing_renewals(date_from, date_to)
+    try:
+        df = search_read(
+            model,
+            [
+                ("event_type", "=", "renewal"),
+                ("date", ">=", date_from),
+                ("date", "<=", f"{date_to} 23:59:59"),
+            ],
+            pick_fields(model, cols),
+            order="date",
+        )
+    except Exception as e:
+        return pd.DataFrame(columns=cols), f"No se pudo leer {model}: {e}"
+    if df.empty:
+        return df, None
+    df["date"] = pd.to_datetime(df["date"])
+    df["mes"] = df["date"].dt.to_period("M").astype(str)
+    df["staff"] = m2o_name(df["staff_sale_order_id"]) if "staff_sale_order_id" in df else ""
+    df["usuario"] = m2o_name(df["user_id"]) if "user_id" in df else ""
+    return df, None
+
+
 @st.cache_data(ttl=600, show_spinner="Cargando suscripciones de Staff...")
 def load_subscriptions(team_id: int | None):
     wanted = [
@@ -1341,12 +1496,21 @@ def plan_period_months(value, unit) -> float:
 
 def staffing_coverage(df: pd.DataFrame, months: list[str],
                       states: tuple[str, ...] = STAFF_COVERAGE_STATES) -> pd.DataFrame:
+    """Plazas cubiertas por mes. Si hay `chain_id`, cuenta cadenas (no eslabones)."""
     if df.empty:
         return pd.DataFrame({"mes": months, "activas": [0] * len(months)})
     sub = df[df["state"].isin(states)] if "state" in df.columns else df
+    start_col = "date_start" if "date_start" in sub.columns else "start_date"
+    end_col = "date_end" if "date_end" in sub.columns else "end_date"
     rows = []
     for mes in months:
-        rows.append({"mes": mes, "activas": int(coverage_mask(sub, "date_start", "date_end", mes).sum())})
+        mask = coverage_mask(sub, start_col, end_col, mes)
+        active = sub[mask]
+        if "chain_id" in active.columns:
+            n = int(active["chain_id"].nunique())
+        else:
+            n = int(len(active))
+        rows.append({"mes": mes, "activas": n})
     return pd.DataFrame(rows)
 
 
@@ -1358,27 +1522,47 @@ def subscription_coverage(df: pd.DataFrame, months: list[str]) -> pd.DataFrame:
         sub = df[df["subscription_state"].isin(SUB_ACTIVE_STATES)]
     rows = []
     for mes in months:
-        rows.append({"mes": mes, "activas": int(coverage_mask(sub, "start_date", "end_date", mes).sum())})
+        mask = coverage_mask(sub, "start_date", "end_date", mes)
+        active = sub[mask]
+        if "chain_id" in active.columns or "origin_id" in active.columns:
+            key = "chain_id" if "chain_id" in active.columns else "origin_id"
+            n = int(pd.to_numeric(active[key], errors="coerce").nunique())
+        else:
+            n = int(len(active))
+        rows.append({"mes": mes, "activas": n})
     return pd.DataFrame(rows)
 
 
 def staffing_pnl_monthly(requests: pd.DataFrame, months: list[str],
                          costo_fijo_mensual: float) -> pd.DataFrame:
-    """Ingreso de plazas − costo del recurso − costo fijo (Diego) por mes."""
+    """Ingreso de plazas − costo del recurso − costo fijo (Diego) por mes.
+
+    Acepta el frame de `load_staff_sale_orders` (con chain_id) o el legacy request.
+    """
     rows = []
-    usable = requests[requests["state"].isin(STAFF_COVERAGE_STATES)] if not requests.empty else requests
+    usable = requests[requests["state"].isin(STAFF_COVERAGE_STATES)] if (
+        not requests.empty and "state" in requests.columns
+    ) else requests
+    start_col = "date_start" if "date_start" in usable.columns else "start_date"
+    end_col = "date_end" if "date_end" in usable.columns else "end_date"
     for mes in months:
         if usable.empty:
             rows.append({
                 "mes": mes, "plazas": 0, "ingreso_plazas": 0.0,
                 "costo_recurso": 0.0, "costo_fijo": costo_fijo_mensual,
-                "neto": -costo_fijo_mensual, "valor_recurso_promedio": 0.0,
+                "neto": -costo_fijo_mensual,
             })
             continue
-        mask = coverage_mask(usable, "date_start", "date_end", mes)
+        mask = coverage_mask(usable, start_col, end_col, mes)
         active = usable[mask]
-        ingreso = float(active["monthly_amount_company_currency"].sum())
-        costo = float(active["purchase_amount_company_currency"].sum())
+        if "chain_id" in active.columns:
+            active = _staff_one_per_chain(active)
+        ingreso = float(pd.to_numeric(
+            active.get("monthly_amount_company_currency", 0), errors="coerce"
+        ).fillna(0.0).sum())
+        costo = float(pd.to_numeric(
+            active.get("purchase_amount_company_currency", 0), errors="coerce"
+        ).fillna(0.0).sum())
         n = int(len(active))
         rows.append({
             "mes": mes,
@@ -1387,7 +1571,6 @@ def staffing_pnl_monthly(requests: pd.DataFrame, months: list[str],
             "costo_recurso": costo,
             "costo_fijo": costo_fijo_mensual,
             "neto": ingreso - costo - costo_fijo_mensual,
-            "valor_recurso_promedio": (costo / n) if n else 0.0,
         })
     return pd.DataFrame(rows)
 
@@ -1586,7 +1769,7 @@ def subscription_cierre_monthly(subs: pd.DataFrame, months: list[str],
 
 def staffing_cierre_monthly(requests: pd.DataFrame, months: list[str]) -> pd.DataFrame:
     """Fallback: valor mensual × meses (date_start→date_end) en el mes de date_start."""
-    fuente = "firefly.staffing.request · valor mensual × meses del contrato"
+    fuente = "sale.order Staff · valor mensual × meses del contrato"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     empty = pd.DataFrame({"mes": months, "vendido": [0.0] * len(months),
@@ -1676,8 +1859,8 @@ def subscription_recurrente_monthly(subs: pd.DataFrame, months: list[str],
 
 
 def staffing_recurrente_monthly(requests: pd.DataFrame, months: list[str]) -> pd.DataFrame:
-    """Fallback: valor mensual de la plaza × meses de vigencia (equivalente a plan mensual)."""
-    fuente = "firefly.staffing.request · valor mensual × meses (plan mensual)"
+    """Ingreso mensual de plazas vigentes (firefly_sale_staff o legacy request)."""
+    fuente = "plazas Staff · valor mensual × meses vigentes"
     if not months:
         return pd.DataFrame(columns=["mes", "vendido", "fuente"])
     if requests is None or requests.empty:
@@ -1693,14 +1876,17 @@ def staffing_recurrente_monthly(requests: pd.DataFrame, months: list[str]) -> pd
 
 def staff_recurrente_monthly(requests: pd.DataFrame | None, subs: pd.DataFrame | None,
                              months: list[str], team_id: int | None = None) -> pd.DataFrame:
-    """KPI anual Staff: valor × plan recurrente (periodos vigentes del año).
+    """Serie de ingreso mensual de plazas (referencia; no es el KPI de vendido CRM).
 
-    Prioriza `firefly.staffing.request` (valor mensual × meses vigentes ≈ los ~333M).
-    Las suscripciones solas pueden inflar (renovaciones / cadenas); solo fallback.
+    Prioriza el frame de `load_staff_sale_orders` (firefly_sale_staff).
     """
     if requests is not None and not requests.empty:
         out = staffing_recurrente_monthly(requests, months)
         if not out.empty and float(out["vendido"].sum()) > 0:
+            # Renombrar fuente si viene del nuevo módulo
+            if "fuente_staff" in requests.columns or "chain_id" in requests.columns:
+                out = out.copy()
+                out["fuente"] = "sale.order Staff · recurring_monthly × vigencia"
             return out
     return subscription_recurrente_monthly(
         subs if subs is not None else pd.DataFrame(), months, team_id=team_id
